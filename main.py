@@ -356,6 +356,50 @@ async def get_intelligence_archive(page: int = 1, limit: int = 50):
         logger.error(f"Error fetching archive: {e}")
         return {"status": "error", "message": str(e)}
 
+@app.get("/api/v1/entities/strategic")
+async def get_strategic_entities():
+    """Fetches high-value, pre-seeded entities with coordinates to render as the 'Knowledge Underlay' on the globe."""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        query = """
+            SELECT 
+                entity_id as uid, 
+                name as headline, 
+                entity_type as domain, 
+                'KNOWLEDGE' as source_type,
+                threat_score,
+                ST_Y(primary_geo) as lat, 
+                ST_X(primary_geo) as lon
+            FROM entities
+            WHERE primary_geo IS NOT NULL
+            AND watch_status != 'PASSIVE'
+            ORDER BY threat_score DESC
+            LIMIT 500;
+        """
+        records = await conn.fetch(query)
+        await conn.close()
+        
+        # We format them similarly to IntelligenceEvents so the UI can easily map them
+        formatted = []
+        for r in records:
+            priority = 'NORMAL'
+            if r['threat_score'] >= 0.8: priority = 'CRITICAL'
+            elif r['threat_score'] >= 0.5: priority = 'HIGH'
+            
+            formatted.append({
+                "uid": str(r['uid']),
+                "headline": r['headline'],
+                "domain": r['domain'],
+                "source_type": r['source_type'],
+                "priority": priority,
+                "geo": {"lat": r['lat'], "lon": r['lon']}
+            })
+            
+        return {"status": "success", "data": formatted}
+    except Exception as e:
+        logger.error(f"Error fetching strategic entities: {e}")
+        return {"status": "error", "message": str(e)}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
