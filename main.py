@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from openai import AsyncOpenAI
 
 # Load environment variables
 load_dotenv()
@@ -21,6 +22,13 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
 DB_NAME = os.getenv("DB_NAME", "pia")
 
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+# LLM Setup
+llm_client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+)
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("pia-api")
@@ -87,6 +95,56 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class ChatRequest(BaseModel):
+    message: str
+    history: List[dict] = []
+
+@app.post("/api/v1/chat")
+async def chat_endpoint(request: ChatRequest):
+    """AI Co-Pilot endpoint for tactical interrogation of the Knowledge Graph."""
+    try:
+        # We perform a basic semantic search across recent UIRs to provide context
+        conn = await asyncpg.connect(DATABASE_URL)
+        # 1. Look for entities matching keywords in the prompt to provide context
+        query = """
+            SELECT content_headline, content_summary, entities, priority 
+            FROM intelligence_records 
+            WHERE created_at > NOW() - INTERVAL '7 days'
+            ORDER BY created_at DESC 
+            LIMIT 10;
+        """
+        recent_intel = await conn.fetch(query)
+        await conn.close()
+        
+        intel_context = "\n".join([f"- [{r['priority']}] {r['content_headline']}: {r['content_summary']}" for r in recent_intel])
+
+        system_prompt = f"""
+        You are the Tactical AI Co-Pilot of the Personal Intelligence Agency (PIA).
+        The user (Director) is interrogating you via the Live Dashboard.
+        
+        Provide concise, tactical, military-grade intelligence summaries based strictly on the provided context.
+        Do not hallucinate facts. If the answer is not in the context, state that data is unavailable.
+        Keep responses under 3 paragraphs. Use bullet points for readability.
+        
+        CURRENT RECENT INTELLIGENCE CONTEXT:
+        {intel_context}
+        """
+
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(request.history)
+        messages.append({"role": "user", "content": request.message})
+
+        response = await llm_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=0.2
+        )
+        
+        return {"status": "success", "reply": response.choices[0].message.content}
+    except Exception as e:
+        logger.error(f"Error in chat endpoint: {e}")
+        return {"status": "error", "message": str(e)}
 
 @app.get("/")
 def read_root():
@@ -262,6 +320,40 @@ async def get_system_logs():
         return {"status": "success", "data": logs}
     except Exception as e:
         logger.error(f"Error fetching logs: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/v1/archive")
+async def get_intelligence_archive(page: int = 1, limit: int = 50):
+    """Fetches paginated historical intelligence records for the Archive Dashboard."""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        offset = (page - 1) * limit
+        query = """
+            SELECT uid, created_at, source_type, priority, domain, content_headline, content_summary, entities
+            FROM intelligence_records
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2;
+        """
+        records = await conn.fetch(query, limit, offset)
+        
+        # Get total count for pagination
+        count_query = "SELECT count(*) FROM intelligence_records;"
+        total = await conn.fetchval(count_query)
+        
+        await conn.close()
+        
+        return {
+            "status": "success",
+            "data": [dict(r) for r in records],
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "total_pages": (total // limit) + (1 if total % limit > 0 else 0)
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error fetching archive: {e}")
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
