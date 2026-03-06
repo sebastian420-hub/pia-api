@@ -199,6 +199,71 @@ async def get_entity_network(entity_name: str, hops: int = 1):
         logger.error(f"Error fetching graph network: {e}")
         return {"status": "error", "message": str(e)}
 
+@app.get("/api/v1/event/{uid}")
+async def get_event_details(uid: str):
+    """Fetches the detailed AI SITREP and extracted entities for a specific intelligence record."""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        query = """
+            SELECT content_summary, entities 
+            FROM intelligence_records 
+            WHERE uid = $1 
+            LIMIT 1;
+        """
+        record = await conn.fetchrow(query, uid)
+        await conn.close()
+        
+        if not record:
+            return {"status": "error", "message": "Record not found"}
+            
+        return {
+            "status": "success", 
+            "data": {
+                "summary": record['content_summary'] or "No AI summary available.",
+                "entities": record['entities'] or []
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error fetching event details: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/v1/logs")
+async def get_system_logs():
+    """Fetches the latest agent activity from the analysis queue to display in the UI Terminal."""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        query = """
+            SELECT 
+                created_at, 
+                status, 
+                assigned_agent, 
+                trigger_type, 
+                priority,
+                error_message
+            FROM analysis_queue 
+            ORDER BY created_at DESC 
+            LIMIT 30;
+        """
+        records = await conn.fetch(query)
+        await conn.close()
+        
+        logs = []
+        for r in records:
+            time_str = r['created_at'].strftime("%H:%M:%S")
+            agent = r['assigned_agent'] or 'SYSTEM'
+            if r['status'] == 'FAILED':
+                msg = f"[{time_str}] [{agent}] ERROR: {r['error_message']}"
+            elif r['status'] == 'PROCESSING':
+                msg = f"[{time_str}] [{agent}] PROCESSING: {r['trigger_type']} ({r['priority']})"
+            else:
+                msg = f"[{time_str}] [{agent}] COMPLETED: {r['trigger_type']}"
+            logs.append(msg)
+            
+        return {"status": "success", "data": logs}
+    except Exception as e:
+        logger.error(f"Error fetching logs: {e}")
+        return {"status": "error", "message": str(e)}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
