@@ -11,9 +11,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import AsyncOpenAI
+from routers import router as api_router
 
 # Load environment variables
 load_dotenv()
+
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
@@ -86,6 +88,8 @@ async def lifespan(app: FastAPI):
     app.state.pg_task.cancel()
 
 app = FastAPI(lifespan=lifespan, title="PIA API Bridge", version="1.0.0")
+
+app.include_router(api_router, prefix="/api/v1")
 
 # Allow the frontend (CesiumJS/React) to access the API
 app.add_middleware(
