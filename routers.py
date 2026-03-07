@@ -203,3 +203,108 @@ async def get_entities_directory(page: int = 1, limit: int = 50):
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@router.get("/graph/network/{entity_name}")
+async def get_entity_network(entity_name: str, hops: int = 3):
+    """Fetches the relational network for a specific entity using a recursive CTE."""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+
+        # 1. Find the root entity
+        root = await conn.fetchrow("SELECT entity_id, name, entity_type FROM entities WHERE name ILIKE $1 LIMIT 1", entity_name)
+        if not root:
+            return {"status": "error", "message": f"Entity '{entity_name}' not found in the Knowledge Graph."}
+
+        # 2. Multi-hop recursive CTE to find connected entities
+        query = """
+            WITH RECURSIVE network_graph AS (
+                -- Base case
+                SELECT 
+                    r.relationship_id,
+                    r.entity_a_id as source_id,
+                    r.entity_b_id as target_id,
+                    r.relationship_type,
+                    r.confidence,
+                    1 as hop_level,
+                    ARRAY[r.entity_a_id, r.entity_b_id] as path
+                FROM entity_relationships r
+                WHERE r.entity_a_id = $1 OR r.entity_b_id = $1
+                
+                UNION
+                
+                -- Recursive step
+                SELECT 
+                    r.relationship_id,
+                    r.entity_a_id as source_id,
+                    r.entity_b_id as target_id,
+                    r.relationship_type,
+                    r.confidence,
+                    ng.hop_level + 1 as hop_level,
+                    ng.path || CASE WHEN r.entity_a_id = ANY(ng.path) THEN r.entity_b_id ELSE r.entity_a_id END as path
+                FROM entity_relationships r
+                JOIN network_graph ng ON (r.entity_a_id = ng.source_id OR r.entity_a_id = ng.target_id OR r.entity_b_id = ng.source_id OR r.entity_b_id = ng.target_id)
+                WHERE ng.hop_level < $2
+                AND NOT (r.entity_a_id = ANY(ng.path) AND r.entity_b_id = ANY(ng.path))
+            )
+            SELECT DISTINCT
+                ng.relationship_id,
+                ng.relationship_type,
+                ng.confidence,
+                ng.hop_level,
+                e1.entity_id as source_id,
+                e1.name as source_name,
+                e1.entity_type as source_type,
+                e2.entity_id as target_id,
+                e2.name as target_name,
+                e2.entity_type as target_type
+            FROM network_graph ng
+            JOIN entities e1 ON ng.source_id = e1.entity_id
+            JOIN entities e2 ON ng.target_id = e2.entity_id
+            ORDER BY ng.hop_level
+            LIMIT 500;
+        """
+        edges = await conn.fetch(query, root['entity_id'], hops)
+
+        nodes_dict = {}
+        links = []
+
+        # Always add the root node
+        nodes_dict[str(root['entity_id'])] = {
+            "id": str(root['entity_id']),
+            "name": root['name'],
+            "group": root['entity_type'],
+            "val": 20 # Root node is larger
+        }
+
+        for edge in edges:
+            s_id = str(edge['source_id'])
+            t_id = str(edge['target_id'])
+
+            # Add Source Node
+            if s_id not in nodes_dict:
+                # Diminish size of nodes further away
+                val = max(2, 10 - (edge['hop_level'] * 2))
+                nodes_dict[s_id] = {"id": s_id, "name": edge['source_name'], "group": edge['source_type'], "val": val}
+
+            # Add Target Node
+            if t_id not in nodes_dict:
+                val = max(2, 10 - (edge['hop_level'] * 2))
+                nodes_dict[t_id] = {"id": t_id, "name": edge['target_name'], "group": edge['target_type'], "val": val}
+
+            links.append({
+                "source": s_id,
+                "target": t_id,
+                "label": edge['relationship_type'],
+                "confidence": edge['confidence']
+            })
+
+        await conn.close()
+        return {
+            "status": "success", 
+            "data": {
+                "nodes": list(nodes_dict.values()), 
+                "links": links
+            }
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
