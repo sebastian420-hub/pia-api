@@ -206,25 +206,27 @@ async def get_entities_directory(page: int = 1, limit: int = 50):
 
 @router.get("/graph/network/{entity_name}")
 async def get_entity_network(entity_name: str, hops: int = 3):
-    """Fetches the relational network for a specific entity using a recursive CTE."""
+    """Fetches the relational network for a specific entity with direction-agnostic aggregation."""
     try:
         conn = await asyncpg.connect(DATABASE_URL)
 
         # 1. Find the root entity
-        root = await conn.fetchrow("SELECT entity_id, name, entity_type FROM entities WHERE name ILIKE $1 LIMIT 1", entity_name)
+        root = await conn.fetchrow("SELECT entity_id, name, entity_type, description FROM entities WHERE name ILIKE $1 LIMIT 1", entity_name)
         if not root:
             return {"status": "error", "message": f"Entity '{entity_name}' not found in the Knowledge Graph."}
 
-        # 2. Multi-hop recursive CTE to find connected entities
+        root_id = root['entity_id']
+
+        # 2. Direction-agnostic multi-hop query
         query = """
-            WITH RECURSIVE network_graph AS (
-                -- Base case
+            WITH RECURSIVE raw_network AS (
+                -- Base case: find all individual relationships
                 SELECT 
-                    r.relationship_id,
-                    r.entity_a_id as source_id,
-                    r.entity_b_id as target_id,
+                    r.entity_a_id,
+                    r.entity_b_id,
                     r.relationship_type,
                     r.confidence,
+                    r.metadata,
                     1 as hop_level,
                     ARRAY[r.entity_a_id, r.entity_b_id] as path
                 FROM entity_relationships r
@@ -232,70 +234,79 @@ async def get_entity_network(entity_name: str, hops: int = 3):
                 
                 UNION
                 
-                -- Recursive step
+                -- Recursive step: find more relationships
                 SELECT 
-                    r.relationship_id,
-                    r.entity_a_id as source_id,
-                    r.entity_b_id as target_id,
+                    r.entity_a_id,
+                    r.entity_b_id,
                     r.relationship_type,
                     r.confidence,
-                    ng.hop_level + 1 as hop_level,
-                    ng.path || CASE WHEN r.entity_a_id = ANY(ng.path) THEN r.entity_b_id ELSE r.entity_a_id END as path
+                    r.metadata,
+                    rn.hop_level + 1 as hop_level,
+                    rn.path || CASE WHEN r.entity_a_id = ANY(rn.path) THEN r.entity_b_id ELSE r.entity_a_id END as path
                 FROM entity_relationships r
-                JOIN network_graph ng ON (r.entity_a_id = ng.source_id OR r.entity_a_id = ng.target_id OR r.entity_b_id = ng.source_id OR r.entity_b_id = ng.target_id)
-                WHERE ng.hop_level < $2
-                AND NOT (r.entity_a_id = ANY(ng.path) AND r.entity_b_id = ANY(ng.path))
+                JOIN raw_network rn ON (r.entity_a_id = rn.entity_a_id OR r.entity_a_id = rn.entity_b_id OR r.entity_b_id = rn.entity_a_id OR r.entity_b_id = rn.entity_b_id)
+                WHERE rn.hop_level < $2
+                AND NOT (r.entity_a_id = ANY(rn.path) AND r.entity_b_id = ANY(rn.path))
             )
-            SELECT DISTINCT
-                ng.relationship_id,
-                ng.relationship_type,
-                ng.confidence,
-                ng.hop_level,
-                e1.entity_id as source_id,
-                e1.name as source_name,
-                e1.entity_type as source_type,
-                e2.entity_id as target_id,
-                e2.name as target_name,
-                e2.entity_type as target_type
-            FROM network_graph ng
-            JOIN entities e1 ON ng.source_id = e1.entity_id
-            JOIN entities e2 ON ng.target_id = e2.entity_id
-            ORDER BY ng.hop_level
+            -- Aggregation to strictly unify all relationships between two nodes into ONE edge
+            SELECT 
+                LEAST(entity_a_id, entity_b_id) as node_1,
+                GREATEST(entity_a_id, entity_b_id) as node_2,
+                string_agg(DISTINCT relationship_type, ', ') as label,
+                MAX(confidence) as confidence,
+                array_agg(DISTINCT metadata->>'reasoning' FILTER (WHERE metadata->>'reasoning' IS NOT NULL)) as reasonings,
+                MIN(hop_level) as min_hop
+            FROM raw_network
+            GROUP BY node_1, node_2
+            ORDER BY min_hop
             LIMIT 500;
         """
-        edges = await conn.fetch(query, root['entity_id'], hops)
+        edges = await conn.fetch(query, root_id, hops)
 
         nodes_dict = {}
         links = []
 
         # Always add the root node
-        nodes_dict[str(root['entity_id'])] = {
-            "id": str(root['entity_id']),
+        nodes_dict[str(root_id)] = {
+            "id": str(root_id),
             "name": root['name'],
             "group": root['entity_type'],
-            "val": 20 # Root node is larger
+            "description": root['description'],
+            "val": 20
         }
 
+        # Collect unique node IDs to fetch their details
+        other_node_ids = set()
         for edge in edges:
-            s_id = str(edge['source_id'])
-            t_id = str(edge['target_id'])
+            other_node_ids.add(edge['node_1'])
+            other_node_ids.add(edge['node_2'])
+        
+        if root_id in other_node_ids:
+            other_node_ids.remove(root_id)
 
-            # Add Source Node
-            if s_id not in nodes_dict:
-                # Diminish size of nodes further away
-                val = max(2, 10 - (edge['hop_level'] * 2))
-                nodes_dict[s_id] = {"id": s_id, "name": edge['source_name'], "group": edge['source_type'], "val": val}
+        # Fetch details for all other nodes in one batch
+        if other_node_ids:
+            node_records = await conn.fetch("SELECT entity_id, name, entity_type, description FROM entities WHERE entity_id = ANY($1)", list(other_node_ids))
+            for nr in node_records:
+                nodes_dict[str(nr['entity_id'])] = {
+                    "id": str(nr['entity_id']),
+                    "name": nr['name'],
+                    "group": nr['entity_type'],
+                    "description": nr['description'],
+                    "val": 5 # Basic size for non-root
+                }
 
-            # Add Target Node
-            if t_id not in nodes_dict:
-                val = max(2, 10 - (edge['hop_level'] * 2))
-                nodes_dict[t_id] = {"id": t_id, "name": edge['target_name'], "group": edge['target_type'], "val": val}
+        for edge in edges:
+            raw_reasons = edge['reasonings'] or []
+            clean_reasons = list(set([r.strip() for r in raw_reasons if r and r.strip()]))
+            combined_reasoning = " | ".join(clean_reasons) if clean_reasons else None
 
             links.append({
-                "source": s_id,
-                "target": t_id,
-                "label": edge['relationship_type'],
-                "confidence": edge['confidence']
+                "source": str(edge['node_1']),
+                "target": str(edge['node_2']),
+                "label": edge['label'],
+                "confidence": edge['confidence'],
+                "reasoning": combined_reasoning
             })
 
         await conn.close()

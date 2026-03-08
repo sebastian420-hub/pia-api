@@ -173,7 +173,20 @@ async def get_active_clusters():
         conn = await asyncpg.connect(DATABASE_URL)
         # Assuming table name is 'intelligence_clusters' or similar from Layer 3
         # We handle this gracefully if table isn't populated yet
-        query = "SELECT cluster_id, name, status, confidence FROM intelligence_clusters WHERE status = 'ACTIVE' LIMIT 50;"
+        query = """
+            SELECT 
+                cluster_id, 
+                title as name, 
+                status, 
+                confidence,
+                priority,
+                domain,
+                ST_Y(geo_centroid) as lat,
+                ST_X(geo_centroid) as lon
+            FROM intelligence_clusters 
+            WHERE status = 'ACTIVE' 
+            LIMIT 50;
+        """
         try:
             records = await conn.fetch(query)
             return {"status": "success", "data": [dict(r) for r in records]}
@@ -183,82 +196,6 @@ async def get_active_clusters():
             await conn.close()
     except Exception as e:
         logger.error(f"Error fetching clusters: {e}")
-        return {"status": "error", "message": str(e)}
-
-@app.get("/api/v1/graph/network/{entity_name}")
-async def get_entity_network(entity_name: str, hops: int = 1):
-    """Fetches the relational network for a specific entity to render in a 3D Force Graph."""
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        
-        # 1. Find the root entity
-        root = await conn.fetchrow("SELECT entity_id, name, entity_type FROM entities WHERE name ILIKE $1 LIMIT 1", entity_name)
-        if not root:
-            return {"status": "error", "message": f"Entity '{entity_name}' not found in the Knowledge Graph."}
-            
-        # 2. Find connected entities (1 hop for now to prevent massive payloads)
-        query = """
-            SELECT 
-                r.relationship_id,
-                r.relationship_type,
-                r.confidence,
-                e_a.entity_id as source_id,
-                e_a.name as source_name,
-                e_a.entity_type as source_type,
-                e_b.entity_id as target_id,
-                e_b.name as target_name,
-                e_b.entity_type as target_type
-            FROM entity_relationships r
-            JOIN entities e_a ON r.entity_a_id = e_a.entity_id
-            JOIN entities e_b ON r.entity_b_id = e_b.entity_id
-            WHERE r.entity_a_id = $1 OR r.entity_b_id = $1
-            LIMIT 100;
-        """
-        edges = await conn.fetch(query, root['entity_id'])
-        
-        nodes_dict = {}
-        links = []
-        
-        # Always add the root node
-        nodes_dict[str(root['entity_id'])] = {
-            "id": str(root['entity_id']),
-            "name": root['name'],
-            "group": root['entity_type'],
-            "val": 20 # Root node is larger
-        }
-        
-        for edge in edges:
-            s_id = str(edge['source_id'])
-            t_id = str(edge['target_id'])
-            
-            # Add Source Node
-            if s_id not in nodes_dict:
-                nodes_dict[s_id] = {"id": s_id, "name": edge['source_name'], "group": edge['source_type'], "val": 5}
-            
-            # Add Target Node
-            if t_id not in nodes_dict:
-                nodes_dict[t_id] = {"id": t_id, "name": edge['target_name'], "group": edge['target_type'], "val": 5}
-                
-            # Add Link
-            links.append({
-                "source": s_id,
-                "target": t_id,
-                "label": edge['relationship_type'],
-                "confidence": edge['confidence']
-            })
-            
-        await conn.close()
-        
-        return {
-            "status": "success",
-            "data": {
-                "nodes": list(nodes_dict.values()),
-                "links": links
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error fetching graph network: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.get("/api/v1/event/{uid}")
