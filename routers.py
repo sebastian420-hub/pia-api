@@ -254,7 +254,7 @@ async def get_entity_network(entity_name: str, hops: int = 3):
                 GREATEST(entity_a_id, entity_b_id) as node_2,
                 string_agg(DISTINCT relationship_type, ', ') as label,
                 MAX(confidence) as confidence,
-                array_agg(DISTINCT metadata->>'reasoning' FILTER (WHERE metadata->>'reasoning' IS NOT NULL)) as reasonings,
+                array_agg(DISTINCT metadata->>'reasoning') FILTER (WHERE metadata->>'reasoning' IS NOT NULL) as reasonings,
                 MIN(hop_level) as min_hop
             FROM raw_network
             GROUP BY node_1, node_2

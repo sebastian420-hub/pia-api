@@ -7,15 +7,19 @@ from typing import List
 
 import asyncpg
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 from routers import router as api_router
+import shutil
 
 # Load environment variables
 load_dotenv()
 
+# Setup Document Directory for Uploads
+DOC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "pia-core", "data", "documents"))
+os.makedirs(DOC_DIR, exist_ok=True)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
@@ -198,6 +202,19 @@ async def get_active_clusters():
         logger.error(f"Error fetching clusters: {e}")
         return {"status": "error", "message": str(e)}
 
+@app.post("/api/v1/documents/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """Receives a document and saves it for the document_agent to process."""
+    try:
+        file_location = os.path.join(DOC_DIR, file.filename)
+        with open(file_location, "wb+") as file_object:
+            shutil.copyfileobj(file.file, file_object)
+        logger.info(f"Received document upload: {file.filename}")
+        return {"status": "success", "message": f"File '{file.filename}' securely uploaded to the ingestion queue."}
+    except Exception as e:
+        logger.error(f"Failed to upload document: {e}")
+        return {"status": "error", "message": f"Failed to upload: {str(e)}"}
+
 @app.get("/api/v1/event/{uid}")
 async def get_event_details(uid: str):
     """Fetches the detailed AI SITREP and extracted entities for a specific intelligence record."""
@@ -228,18 +245,33 @@ async def get_event_details(uid: str):
 
 @app.get("/api/v1/logs")
 async def get_system_logs():
-    """Fetches the latest agent activity from the analysis queue to display in the UI Terminal."""
+    """Fetches the latest agent activity across all tables to display in the UI Terminal."""
     try:
         conn = await asyncpg.connect(DATABASE_URL)
+        # Union the analysis queue (Analyst Agent) with intelligence records (Ingestor Agents)
         query = """
-            SELECT 
-                created_at, 
-                status, 
-                assigned_agent, 
-                trigger_type, 
-                priority,
-                error_message
-            FROM analysis_queue 
+            SELECT created_at, agent, action, message, status
+            FROM (
+                -- Analyst Agent Logs
+                SELECT 
+                    created_at, 
+                    COALESCE(assigned_agent, 'SYSTEM') as agent, 
+                    trigger_type as action, 
+                    COALESCE(error_message, 'Job ID: ' || queue_id::text) as message,
+                    status
+                FROM analysis_queue 
+                
+                UNION ALL
+                
+                -- Ingestor Agent Logs (News, Seismic, Aviation, Maritime, Document)
+                SELECT 
+                    created_at, 
+                    source_agent as agent, 
+                    'INGEST_' || source_type as action, 
+                    content_headline as message,
+                    'DONE' as status
+                FROM intelligence_records
+            ) combined_logs
             ORDER BY created_at DESC 
             LIMIT 30;
         """
@@ -249,13 +281,17 @@ async def get_system_logs():
         logs = []
         for r in records:
             time_str = r['created_at'].strftime("%H:%M:%S")
-            agent = r['assigned_agent'] or 'SYSTEM'
-            if r['status'] == 'FAILED':
-                msg = f"[{time_str}] [{agent}] ERROR: {r['error_message']}"
-            elif r['status'] == 'PROCESSING':
-                msg = f"[{time_str}] [{agent}] PROCESSING: {r['trigger_type']} ({r['priority']})"
+            agent = r['agent']
+            status = r['status']
+            action = r['action']
+            message = r['message']
+            
+            if status == 'FAILED':
+                msg = f"[{time_str}] [{agent}] ERROR: {message}"
+            elif status == 'PROCESSING':
+                msg = f"[{time_str}] [{agent}] PROCESSING: {action}"
             else:
-                msg = f"[{time_str}] [{agent}] COMPLETED: {r['trigger_type']}"
+                msg = f"[{time_str}] [{agent}] {action}: {message}"
             logs.append(msg)
             
         return {"status": "success", "data": logs}
