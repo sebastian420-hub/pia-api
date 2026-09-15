@@ -1,0 +1,22 @@
+# Fly.io: machines stop when idle and start on demand — billed per second.
+#   fly launch --copy-config --name pia-relay --region iad   (iad = Virginia, US)
+#   fly secrets set RELAY_TOKEN=<same value as RELAY_TOKEN in pia/.env>
+# Then in pia/.env:
+#   RELAY_URL=https://pia-relay.fly.dev
+#   RELAY_START_CMD="fly machine start <machine-id> -a pia-relay"
+#   RELAY_STOP_CMD="fly machine stop <machine-id> -a pia-relay"
+app = "pia-relay"
+primary_region = "iad"
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
