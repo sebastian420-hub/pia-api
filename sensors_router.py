@@ -52,7 +52,7 @@ async def get_layers(pool: asyncpg.Pool = Depends(get_pool)):
     async with pool.acquire() as conn:
         live = await _active_session(conn)
         rows = await conn.fetch("""
-            SELECT 'reports'    AS layer_id, 'Reports'    AS label, count(*) AS count FROM intelligence_records WHERE created_at > NOW() - INTERVAL '24 hours'
+            SELECT 'reports'    AS layer_id, 'Reports'    AS label, count(*) AS count FROM intelligence_records WHERE created_at > NOW() - INTERVAL '24 hours' AND COALESCE(metadata->>'skip_analysis','false') <> 'true'
             UNION ALL SELECT 'entities',   'Entities',   count(*) FROM entities WHERE resolution = 'RESOLVED' AND origin <> 'geonames' AND mention_count > 0
             UNION ALL SELECT 'events',     'Events',     count(*) FROM events WHERE event_time > NOW() - INTERVAL '24 hours'
             UNION ALL SELECT 'situations', 'Situations', count(*) FROM intelligence_clusters WHERE status = 'ACTIVE'

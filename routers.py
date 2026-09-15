@@ -161,6 +161,24 @@ async def upload_document(file: UploadFile = File(...)):
     return {"status": "success", "message": f"File '{original}' queued for ingestion.", "stored_as": safe_name}
 
 
+@router.get("/reports/{uid}")
+async def get_report(uid: uuid.UUID, pool: asyncpg.Pool = Depends(get_pool)):
+    """One report with the fields the UI needs to open it as a selection."""
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow("""
+            SELECT uid, created_at, published_at, source_type, source_id, source_url, priority, domain,
+                   content_headline, content_summary, entities, body_status, ST_Y(geo) AS lat, ST_X(geo) AS lon
+            FROM intelligence_records WHERE uid = $1
+        """, uid)
+    if not r:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Report not found")
+    d = dict(r)
+    d["uid"] = str(d["uid"])
+    lat, lon = d.pop("lat"), d.pop("lon")
+    d["geo"] = {"lat": lat, "lon": lon} if lat is not None and lon is not None else None
+    return {"status": "success", "data": d}
+
+
 @router.get("/event/{uid}")
 async def get_event_details(uid: uuid.UUID, pool: asyncpg.Pool = Depends(get_pool)):
     """Fetches the AI summary and extracted entities for one intelligence record."""
@@ -199,6 +217,7 @@ async def get_system_logs(pool: asyncpg.Pool = Depends(get_pool)):
                        content_headline as message,
                        'DONE' as status
                 FROM intelligence_records
+                WHERE COALESCE(metadata->>'skip_analysis', 'false') <> 'true'
             ) combined_logs
             ORDER BY created_at DESC
             LIMIT 30;
@@ -229,10 +248,11 @@ async def get_intelligence_archive(
             SELECT uid, created_at, source_type, priority, domain, content_headline, content_summary, entities,
                    ST_Y(geo) as lat, ST_X(geo) as lon
             FROM intelligence_records
+            WHERE COALESCE(metadata->>'skip_analysis', 'false') <> 'true'
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2;
         """, limit, offset)
-        total = await conn.fetchval("SELECT count(*) FROM intelligence_records;")
+        total = await conn.fetchval("SELECT count(*) FROM intelligence_records WHERE COALESCE(metadata->>'skip_analysis', 'false') <> 'true';")
 
     data = []
     for r in records:

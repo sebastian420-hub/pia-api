@@ -197,6 +197,19 @@ async def search_entities(q: str = Query(..., min_length=1, max_length=200), lim
 
 # ── review queue ────────────────────────────────────────────────────────────
 
+import re as _re
+import unicodedata as _ud
+
+
+def _norm(name: str) -> str:
+    """Mirror of pia.kg.normalize.normalize (kept in sync by hand; used only for cache lookups)."""
+    s = _ud.normalize("NFKD", name or "")
+    s = "".join(ch for ch in s if not _ud.combining(ch)).strip().lower()
+    s = _re.sub(r"^(the|a|an)\s+", "", s)
+    s = _re.sub(r"[’']s$", "", s)
+    s = _re.sub(r"[^\w\s\-]", " ", s)
+    return _re.sub(r"\s+", " ", s).strip()
+
 _KIND_BY_CLASS = {"Q5": "PERSON", "Q6256": "COUNTRY", "Q3624078": "COUNTRY", "Q515": "PLACE", "Q43229": "ORG",
                   "Q4830453": "ORG", "Q7278": "ORG", "Q484652": "ORG", "Q17149090": "ORG", "Q11446": "VESSEL", "Q11436": "AIRCRAFT"}
 
@@ -250,6 +263,14 @@ async def review_queue(limit: int = Query(50, ge=1, le=200), pool: asyncpg.Pool 
         if cands:
             for c in await conn.fetch("SELECT qid, name, kind, description FROM entities WHERE qid = ANY($1)", list(cands)):
                 cands[c['qid']] = dict(c)
+            # labels/descriptions for candidates that were never loaded live in the search cache
+            cache_rows = await conn.fetch("SELECT candidates FROM resolution_cache WHERE query_norm = ANY($1)",
+                                          [_norm(r['name']) for r in rows])
+            for cr in cache_rows:
+                for c in (json.loads(cr['candidates']) if isinstance(cr['candidates'], str) else cr['candidates']) or []:
+                    q = c.get('qid')
+                    if q in cands and cands[q] is None:
+                        cands[q] = {"qid": q, "name": c.get('label'), "description": c.get('description'), "kind": None}
     out = []
     for r in rows:
         meta = metas[str(r['entity_id'])]
