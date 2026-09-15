@@ -263,7 +263,7 @@ async def get_strategic_entities(pool: asyncpg.Pool = Depends(get_pool)):
     """Watched entities with coordinates (the 'Knowledge Underlay'), globally."""
     async with pool.acquire() as conn:
         records = await conn.fetch("""
-            SELECT entity_id as uid, name as headline, entity_type as domain, 'KNOWLEDGE' as source_type,
+            SELECT entity_id as uid, name as headline, kind as domain, 'KNOWLEDGE' as source_type,
                    threat_score, ST_Y(primary_geo) as lat, ST_X(primary_geo) as lon
             FROM entities
             WHERE primary_geo IS NOT NULL AND watch_status != 'PASSIVE'
@@ -301,7 +301,7 @@ async def get_entities_by_bbox(
     args = [v for env in envelopes for v in env]
     async with pool.acquire() as conn:
         records = await conn.fetch(f"""
-            SELECT entity_id as uid, name as headline, entity_type as domain, 'KNOWLEDGE' as source_type,
+            SELECT entity_id as uid, name as headline, kind as domain, 'KNOWLEDGE' as source_type,
                    threat_score, ST_Y(primary_geo) as lat, ST_X(primary_geo) as lon
             FROM entities
             WHERE primary_geo IS NOT NULL AND watch_status != 'PASSIVE' AND ({where})
@@ -321,25 +321,27 @@ async def get_entities_directory(
     offset = (page - 1) * limit
     async with pool.acquire() as conn:
         records = await conn.fetch("""
-            SELECT entity_id as uid, entity_type as domain, name as headline,
-                   description as content_summary, confidence, threat_score, watch_status
+            SELECT entity_id as uid, qid, kind as domain, name as headline,
+                   description as content_summary, threat_score, watch_status, mention_count
             FROM entities
-            WHERE name IS NOT NULL AND description IS NOT NULL
-            ORDER BY watch_status DESC, threat_score DESC, mention_count DESC
+            WHERE resolution = 'RESOLVED' AND origin <> 'geonames' AND mention_count > 0
+            ORDER BY mention_count DESC, sitelinks DESC
             LIMIT $1 OFFSET $2;
         """, limit, offset)
         total = await conn.fetchval(
-            "SELECT count(*) FROM entities WHERE name IS NOT NULL AND description IS NOT NULL;"
+            "SELECT count(*) FROM entities WHERE resolution = 'RESOLVED' AND origin <> 'geonames' AND mention_count > 0;"
         )
 
     results = [{
         "uid": str(r['uid']),
+        "qid": r['qid'],
         "created_at": None,
         "source_type": "KNOWLEDGE",
         "priority": priority_from_threat(r['threat_score']),
         "domain": r['domain'],
         "content_headline": r['headline'],
         "content_summary": r['content_summary'],
+        "mentions": r['mention_count'],
     } for r in records]
     return {"status": "success", "data": results, "pagination": paginate(total, page, limit)}
 
@@ -378,11 +380,11 @@ async def semantic_search(body: SemanticSearchRequest, pool: asyncpg.Pool = Depe
             return {"status": "success", "data": [dict(r) for r in rows]}
 
         rows = await conn.fetch("""
-            SELECT entity_id as uid, entity_type as domain, name as headline,
-                   description as content_summary, confidence, threat_score, watch_status,
+            SELECT entity_id as uid, kind as domain, name as headline,
+                   description as content_summary, threat_score, watch_status,
                    1 - (embedding <=> $1::vector) AS similarity
             FROM entities
-            WHERE embedding IS NOT NULL
+            WHERE embedding IS NOT NULL AND resolution = 'RESOLVED'
             ORDER BY embedding <=> $1::vector
             LIMIT $2;
         """, embedding_str, body.limit)
@@ -407,92 +409,51 @@ async def semantic_search(body: SemanticSearchRequest, pool: asyncpg.Pool = Depe
 @router.get("/graph/network/{entity_name}")
 async def get_entity_network(
     entity_name: str,
-    hops: int = Query(2, ge=1, le=3),
+    hops: int = Query(1, ge=1, le=2),
+    min_weight: float = Query(0.05, ge=0),
     pool: asyncpg.Pool = Depends(get_pool),
 ):
-    """Relational network for an entity, direction-agnostic, one edge per node pair."""
+    """Relations around an entity (computed from events + Wikidata). Nodes/links shape for the web view."""
     async with pool.acquire() as conn:
-        root = await conn.fetchrow(
-            "SELECT entity_id, name, entity_type, description FROM entities WHERE name ILIKE $1 "
-            "ORDER BY mention_count DESC LIMIT 1",
-            entity_name,
-        )
+        root = await conn.fetchrow("""
+            SELECT e.entity_id, e.qid, e.name, e.kind, e.description, e.mention_count
+            FROM entities e
+            LEFT JOIN entity_aliases a ON a.entity_id = e.entity_id
+            WHERE (a.alias_norm = lower($1) OR e.qid = $1 OR e.entity_id::text = $1) AND e.resolution = 'RESOLVED'
+            ORDER BY e.mention_count DESC, e.sitelinks DESC LIMIT 1
+        """, entity_name)
         if not root:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Entity '{entity_name}' not found in the Knowledge Graph.")
-        root_id = root['entity_id']
-
-        edges = await conn.fetch("""
-            WITH RECURSIVE raw_network AS (
-                SELECT r.entity_a_id, r.entity_b_id, r.relationship_type, r.confidence, r.metadata,
-                       1 as hop_level, ARRAY[r.entity_a_id, r.entity_b_id] as path
-                FROM entity_relationships r
-                WHERE (r.entity_a_id = $1 OR r.entity_b_id = $1) AND r.still_valid
-
-                UNION
-
-                SELECT r.entity_a_id, r.entity_b_id, r.relationship_type, r.confidence, r.metadata,
-                       rn.hop_level + 1,
-                       rn.path || CASE WHEN r.entity_a_id = ANY(rn.path) THEN r.entity_b_id ELSE r.entity_a_id END
-                FROM entity_relationships r
-                JOIN raw_network rn ON (r.entity_a_id = rn.entity_a_id OR r.entity_a_id = rn.entity_b_id
-                                     OR r.entity_b_id = rn.entity_a_id OR r.entity_b_id = rn.entity_b_id)
-                WHERE rn.hop_level < $2 AND r.still_valid
-                  AND NOT (r.entity_a_id = ANY(rn.path) AND r.entity_b_id = ANY(rn.path))
-            )
-            SELECT LEAST(entity_a_id, entity_b_id) as node_1,
-                   GREATEST(entity_a_id, entity_b_id) as node_2,
-                   string_agg(DISTINCT relationship_type, ', ') as label,
-                   MAX(confidence) as confidence,
-                   array_agg(DISTINCT metadata->>'reasoning') FILTER (WHERE metadata->>'reasoning' IS NOT NULL) as reasonings,
-                   MIN(hop_level) as min_hop
-            FROM raw_network
-            GROUP BY node_1, node_2
-            ORDER BY min_hop
-            LIMIT 500;
-        """, root_id, hops)
-
-        nodes_dict = {str(root_id): {
-            "id": str(root_id), "name": root['name'], "group": root['entity_type'],
-            "description": root['description'], "val": 20,
-        }}
-        other_ids = {e['node_1'] for e in edges} | {e['node_2'] for e in edges}
-        other_ids.discard(root_id)
-        if other_ids:
-            for nr in await conn.fetch(
-                "SELECT entity_id, name, entity_type, description FROM entities WHERE entity_id = ANY($1)",
-                list(other_ids),
-            ):
-                nodes_dict[str(nr['entity_id'])] = {
-                    "id": str(nr['entity_id']), "name": nr['name'], "group": nr['entity_type'],
-                    "description": nr['description'], "val": 5,
-                }
-
-        # relationship ids let the UI send feedback on a specific edge
-        rel_rows = await conn.fetch("""
-            SELECT relationship_id, LEAST(entity_a_id, entity_b_id) as node_1,
-                   GREATEST(entity_a_id, entity_b_id) as node_2, relationship_type
-            FROM entity_relationships
-            WHERE entity_a_id = ANY($1) AND entity_b_id = ANY($1) AND still_valid
-        """, list(other_ids | {root_id}))
-    rel_index = {}
-    for rr in rel_rows:
-        rel_index.setdefault((rr['node_1'], rr['node_2']), []).append(
-            {"relationship_id": str(rr['relationship_id']), "type": rr['relationship_type']}
-        )
-
-    links = []
-    for edge in edges:
-        clean = sorted({r.strip() for r in (edge['reasonings'] or []) if r and r.strip()})
-        links.append({
-            "source": str(edge['node_1']),
-            "target": str(edge['node_2']),
-            "label": edge['label'],
-            "confidence": edge['confidence'],
-            "reasoning": " | ".join(clean) if clean else None,
-            "relationships": rel_index.get((edge['node_1'], edge['node_2']), []),
-        })
-
-    return {"status": "success", "data": {"nodes": list(nodes_dict.values()), "links": links}}
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"'{entity_name}' is not in the knowledge web.")
+        frontier = {root['entity_id']}
+        seen = set(frontier)
+        edges = []
+        for _ in range(hops):
+            rows = await conn.fetch("""
+                SELECT a_id, b_id, kind, source, label, event_count, weight, first_seen, last_seen
+                FROM relations WHERE (a_id = ANY($1) OR b_id = ANY($1)) AND weight >= $2
+                ORDER BY weight DESC LIMIT 300
+            """, list(frontier), min_weight)
+            edges.extend(rows)
+            nxt = {r['a_id'] for r in rows} | {r['b_id'] for r in rows}
+            frontier = nxt - seen
+            seen |= nxt
+        nodes = await conn.fetch(
+            "SELECT entity_id, qid, name, kind, description, mention_count FROM entities WHERE entity_id = ANY($1)", list(seen))
+    node_map = {str(n['entity_id']): {"id": str(n['entity_id']), "qid": n['qid'], "name": n['name'], "group": n['kind'],
+                                      "description": n['description'], "val": max(3, min(30, 3 + (n['mention_count'] or 0)))}
+                for n in nodes}
+    node_map[str(root['entity_id'])]["val"] = 30
+    dedup = {}
+    for e in edges:
+        key = (str(e['a_id']), str(e['b_id']), e['kind'], e['source'])
+        if key in dedup:
+            continue
+        dedup[key] = {
+            "source": str(e['a_id']), "target": str(e['b_id']), "label": f"{e['kind'].lower()} · {e['label'] or e['source']}",
+            "kind": e['kind'], "origin": e['source'], "confidence": round(min(1.0, float(e['weight'])), 3),
+            "event_count": e['event_count'], "first_seen": e['first_seen'], "last_seen": e['last_seen'], "reasoning": None,
+        }
+    return {"status": "success", "data": {"nodes": list(node_map.values()), "links": list(dedup.values())}}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -500,44 +461,24 @@ async def get_entity_network(
 # ═══════════════════════════════════════════════════════════
 
 class FeedbackRequest(BaseModel):
-    relationship_id: uuid.UUID
-    feedback_type: str = Field(pattern="^(CONFIRMED|REJECTED_HALLUCINATION|REJECTED_WRONG_PREDICATE)$")
+    event_id: uuid.UUID
+    feedback_type: str = Field(pattern="^(CONFIRMED|REJECTED_HALLUCINATION|REJECTED_WRONG_ACTION)$")
     human_correction: Optional[str] = Field(None, max_length=2000)
 
 
 @router.post("/feedback", status_code=status.HTTP_201_CREATED)
 async def submit_feedback(body: FeedbackRequest, pool: asyncpg.Pool = Depends(get_pool)):
-    """
-    Records a human verdict on an inferred relationship. Rejections feed the analyst's
-    negative few-shot prompt and mark the edge invalid; confirmations raise its confidence.
-    """
+    """Human verdict on one extracted event (a claim). Rejections remove it from the web."""
     async with pool.acquire() as conn:
-        rel = await conn.fetchrow("""
-            SELECT r.relationship_id, r.relationship_type, r.client_id, a.name as subject, b.name as object
-            FROM entity_relationships r
-            JOIN entities a ON a.entity_id = r.entity_a_id
-            JOIN entities b ON b.entity_id = r.entity_b_id
-            WHERE r.relationship_id = $1
-        """, body.relationship_id)
-        if not rel:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Relationship not found")
-
+        ev = await conn.fetchrow("SELECT event_id, event_time FROM events WHERE event_id = $1", body.event_id)
+        if not ev:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
         async with conn.transaction():
-            feedback_id = await conn.fetchval("""
-                INSERT INTO ai_feedback (client_id, relationship_id, original_subject, original_predicate,
-                                         original_object, feedback_type, human_correction)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING feedback_id
-            """, rel['client_id'] or DEFAULT_CLIENT_ID, rel['relationship_id'], rel['subject'],
-                rel['relationship_type'], rel['object'], body.feedback_type, body.human_correction)
-
+            fid = await conn.fetchval("""
+                INSERT INTO ai_feedback (event_id, feedback_type, human_correction) VALUES ($1, $2, $3) RETURNING feedback_id
+            """, body.event_id, body.feedback_type, body.human_correction)
             if body.feedback_type == 'CONFIRMED':
-                await conn.execute(
-                    "UPDATE entity_relationships SET confidence = LEAST(confidence + 0.2, 0.99), updated_at = NOW() WHERE relationship_id = $1",
-                    rel['relationship_id'])
+                await conn.execute("UPDATE events SET confidence = LEAST(confidence + 0.2, 0.99) WHERE event_id = $1", body.event_id)
             else:
-                await conn.execute(
-                    "UPDATE entity_relationships SET still_valid = FALSE, updated_at = NOW() WHERE relationship_id = $1",
-                    rel['relationship_id'])
-
-    return {"status": "success", "data": {"feedback_id": str(feedback_id)}}
+                await conn.execute("DELETE FROM events WHERE event_id = $1", body.event_id)
+    return {"status": "success", "data": {"feedback_id": str(fid)}}
