@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import json
 import uuid
 from typing import List, Optional
 
@@ -426,6 +427,14 @@ async def semantic_search(body: SemanticSearchRequest, pool: asyncpg.Pool = Depe
 # GRAPH
 # ═══════════════════════════════════════════════════════════
 
+def _top_topics(raw, top: int = 3):
+    """relations.topics jsonb → [{"topic", "count"}], strongest first."""
+    if not raw:
+        return []
+    d = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    return [{"topic": k, "count": v} for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:top]]
+
+
 @router.get("/graph/network/{entity_name}")
 async def get_entity_network(
     entity_name: str,
@@ -459,7 +468,7 @@ async def get_entity_network(
         edges = []
         for _ in range(hops):
             rows = await conn.fetch("""
-                SELECT a_id, b_id, kind, source, label, event_count, weight, first_seen, last_seen
+                SELECT a_id, b_id, kind, source, label, event_count, weight, first_seen, last_seen, topics
                 FROM relations
                 WHERE (a_id = ANY($1) OR b_id = ANY($1))
                   AND ($2::text[] IS NULL OR kind = ANY($2))
@@ -503,6 +512,7 @@ async def get_entity_network(
             "label": e['label'] or e['kind'].lower(), "confidence": round(min(1.0, float(e['weight'])), 3),
             "weight": round(float(e['weight']), 3), "event_count": e['event_count'],
             "outlets": outlets.get((e['a_id'], e['b_id']), []),
+            "topics": _top_topics(e['topics']),
             "first_seen": e['first_seen'], "last_seen": e['last_seen'], "reasoning": None,
         }
     return {"status": "success", "data": {"root": str(root['entity_id']), "nodes": list(node_map.values()), "links": list(dedup.values())}}

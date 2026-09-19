@@ -57,7 +57,7 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
             FROM mentions WHERE entity_id = $1
         """, eid)
         rels = await conn.fetch("""
-            SELECT r.kind, r.source, r.label, r.event_count, r.weight, r.first_seen, r.last_seen, r.directed,
+            SELECT r.kind, r.source, r.label, r.event_count, r.weight, r.first_seen, r.last_seen, r.directed, r.topics,
                    (r.a_id = $1) AS outgoing,
                    o.entity_id AS other_id, o.qid AS other_qid, o.name AS other_name, o.kind AS other_kind
             FROM relations r JOIN entities o ON o.entity_id = CASE WHEN r.a_id = $1 THEN r.b_id ELSE r.a_id END
@@ -73,18 +73,10 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
               AND event_time > NOW() - INTERVAL '90 days' GROUP BY action ORDER BY n DESC
         """, eid)
         pair_sources = await conn.fetch("""
-            SELECT CASE WHEN actor_id = $1 THEN target_id ELSE actor_id END AS other_id,
-                   CASE action
-                     WHEN 'ATTACK' THEN 'HOSTILE' WHEN 'THREATEN' THEN 'HOSTILE' WHEN 'SANCTION' THEN 'HOSTILE'
-                     WHEN 'COERCE' THEN 'HOSTILE' WHEN 'ACCUSE' THEN 'HOSTILE' WHEN 'ARREST' THEN 'HOSTILE'
-                     WHEN 'PROTEST' THEN 'HOSTILE' WHEN 'REJECT' THEN 'HOSTILE'
-                     WHEN 'COOPERATE' THEN 'COOPERATIVE' WHEN 'AID' THEN 'COOPERATIVE' WHEN 'AGREE' THEN 'COOPERATIVE'
-                     WHEN 'MEET' THEN 'COOPERATIVE' WHEN 'VISIT' THEN 'COOPERATIVE' WHEN 'APPEAL' THEN 'COOPERATIVE'
-                     WHEN 'APPOINT' THEN 'ROLE' WHEN 'RESIGN' THEN 'ROLE' WHEN 'ELECT' THEN 'ROLE'
-                     WHEN 'ACQUIRE' THEN 'OWNERSHIP' WHEN 'INVEST' THEN 'OWNERSHIP' ELSE NULL END AS kind,
+            SELECT CASE WHEN actor_id = $1 THEN target_id ELSE actor_id END AS other_id, kind,
                    array_agg(DISTINCT COALESCE(source_id, origin)) AS srcs,
                    array_agg(DISTINCT action) AS actions
-            FROM events WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL
+            FROM events WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL
             GROUP BY 1, 2
         """, eid)
     srcs_by_pair = {(r['other_id'], r['kind']): {"sources": list(r['srcs']), "actions": list(r['actions'])} for r in pair_sources}
@@ -95,6 +87,7 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
             "sources": extra.get("sources", []), "actions": extra.get("actions", []),
             "entity_id": str(r['other_id']), "qid": r['other_qid'], "name": r['other_name'], "kind": r['other_kind'],
             "label": r['label'], "source": r['source'], "event_count": r['event_count'], "weight": round(float(r['weight']), 3),
+            "topics": _topics(r['topics']),
             "first_seen": r['first_seen'], "last_seen": r['last_seen'], "direction": ("out" if r['outgoing'] else "in") if r['directed'] else None,
         })
     return {"status": "success", "data": {
@@ -143,6 +136,14 @@ def _event(r) -> dict:
     return d
 
 
+def _topics(raw, top: int = 3):
+    """relations.topics jsonb ({"diplomacy": 26, ...}) → [{"topic", "count"}] sorted, top N."""
+    if not raw:
+        return []
+    d = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    return [{"topic": k, "count": v} for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:top]]
+
+
 @router.get("/kg/relations/{a}/{b}")
 async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200), pool: asyncpg.Pool = Depends(get_pool)):
     """Why are these two connected: the events (with quotes) and the Wikidata facts between them."""
@@ -150,10 +151,12 @@ async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200)
         ea, eb = await _find(conn, a), await _find(conn, b)
         if not ea or not eb:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Entity not found")
-        rels = await conn.fetch("SELECT kind, source, label, event_count, weight, first_seen, last_seen FROM relations WHERE (a_id = $1 AND b_id = $2) OR (a_id = $2 AND b_id = $1)",
+        rels = await conn.fetch("SELECT kind, source, label, event_count, weight, first_seen, last_seen, topics FROM relations WHERE (a_id = $1 AND b_id = $2) OR (a_id = $2 AND b_id = $1)",
                                 ea['entity_id'], eb['entity_id'])
         evs = await conn.fetch("""
-            SELECT ev.event_id, ev.event_time, ev.action, ev.confidence, ev.quote, ev.source_id, ev.origin, ev.report_uid, u.content_headline, u.source_url,
+            SELECT ev.event_id, ev.event_time, ev.action, ev.kind, ev.topic, ev.code, ev.confidence, ev.quote, ev.source_id, ev.origin, ev.report_uid,
+                   u.content_headline, u.source_url,
+                   CASE WHEN ev.origin = 'gdelt' THEN split_part(u.content_summary, ':', 1) END AS coded_as,
                    a.name AS actor, t.name AS target
             FROM events ev LEFT JOIN intelligence_records u ON u.uid = ev.report_uid
             LEFT JOIN entities a ON a.entity_id = ev.actor_id LEFT JOIN entities t ON t.entity_id = ev.target_id
@@ -168,7 +171,7 @@ async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200)
         """, ea['entity_id'], eb['entity_id'])
     return {"status": "success", "data": {
         "a": _entity(ea), "b": _entity(eb),
-        "relations": [dict(r) for r in rels],
+        "relations": [dict(r, topics=_topics(r['topics'])) for r in rels],
         "events": [dict(e, event_id=str(e['event_id']), report_uid=str(e['report_uid']) if e['report_uid'] else None) for e in evs],
         "shared_reports": [dict(s, uid=str(s['uid'])) for s in shared],
     }}
