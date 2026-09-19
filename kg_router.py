@@ -176,6 +176,74 @@ async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200)
         "shared_reports": [dict(s, uid=str(s['uid'])) for s in shared],
     }}
 
+WINDOWS = {"24h": "24 hours", "7d": "7 days", "30d": "30 days", "90d": "90 days"}
+
+
+@router.get("/kg/web/overview")
+async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
+                       min_events: int = Query(3, ge=1), limit: int = Query(400, ge=10, le=2000),
+                       pool: asyncpg.Pool = Depends(get_pool)):
+    """
+    The web from far away, for the globe: every entity that acted (or was acted on) in the
+    window, with its position (own, or its country's), its activity, and the strongest pairs
+    between them — one link per pair, with the hostile and cooperative counts side by side.
+    """
+    interval = WINDOWS[window]
+    async with pool.acquire() as conn:
+        pairs = await conn.fetch(f"""
+            WITH pt AS (
+                SELECT LEAST(actor_id, target_id) AS a, GREATEST(actor_id, target_id) AS b, kind,
+                       COUNT(*) AS n, MAX(event_time) AS last_seen,
+                       array_agg(DISTINCT COALESCE(source_id, origin)) AS outlets,
+                       jsonb_object_agg(COALESCE(topic, 'other'), 1) AS _t
+                FROM events
+                WHERE actor_id IS NOT NULL AND target_id IS NOT NULL AND actor_id <> target_id
+                  AND kind IN ('HOSTILE', 'COOPERATIVE') AND event_time > NOW() - INTERVAL '{interval}'
+                GROUP BY 1, 2, 3
+            ), topics AS (
+                SELECT LEAST(actor_id, target_id) AS a, GREATEST(actor_id, target_id) AS b,
+                       COALESCE(topic, 'other') AS topic, COUNT(*) AS n
+                FROM events
+                WHERE actor_id IS NOT NULL AND target_id IS NOT NULL AND actor_id <> target_id
+                  AND kind IN ('HOSTILE', 'COOPERATIVE') AND event_time > NOW() - INTERVAL '{interval}'
+                GROUP BY 1, 2, 3
+            )
+            SELECT a, b,
+                   SUM(n) AS event_count,
+                   SUM(n) FILTER (WHERE kind = 'HOSTILE') AS hostile_n,
+                   SUM(n) FILTER (WHERE kind = 'COOPERATIVE') AS coop_n,
+                   MAX(last_seen) AS last_seen,
+                   (SELECT array_agg(DISTINCT o) FROM pt p2, unnest(p2.outlets) o WHERE p2.a = pt.a AND p2.b = pt.b) AS outlets,
+                   (SELECT jsonb_object_agg(topic, n) FROM topics t WHERE t.a = pt.a AND t.b = pt.b) AS topics
+            FROM pt
+            GROUP BY a, b
+            HAVING SUM(n) >= $1
+            ORDER BY SUM(n) DESC
+            LIMIT $2
+        """, min_events, limit)
+        ids = list({r['a'] for r in pairs} | {r['b'] for r in pairs})
+        nodes = await conn.fetch(f"""
+            SELECT e.entity_id, e.qid, e.name, e.kind, e.country_qid,
+                   COALESCE(ST_Y(e.primary_geo), ST_Y(c.primary_geo)) AS lat,
+                   COALESCE(ST_X(e.primary_geo), ST_X(c.primary_geo)) AS lon,
+                   (e.primary_geo IS NULL AND c.primary_geo IS NOT NULL) AS orbits,
+                   c.entity_id AS country_id,
+                   (SELECT COUNT(*) FROM events ev WHERE (ev.actor_id = e.entity_id OR ev.target_id = e.entity_id)
+                       AND ev.event_time > NOW() - INTERVAL '{interval}') AS activity
+            FROM entities e LEFT JOIN entities c ON c.qid = e.country_qid AND c.kind = 'COUNTRY'
+            WHERE e.entity_id = ANY($1)
+        """, ids)
+    return {"status": "success", "data": {
+        "window": window,
+        "nodes": [{"id": str(n['entity_id']), "qid": n['qid'], "name": n['name'], "kind": n['kind'],
+                   "lat": n['lat'], "lon": n['lon'], "orbits": n['orbits'],
+                   "country_id": str(n['country_id']) if n['country_id'] else None, "activity": n['activity']} for n in nodes],
+        "links": [{"source": str(r['a']), "target": str(r['b']), "event_count": r['event_count'],
+                   "hostile_n": r['hostile_n'] or 0, "coop_n": r['coop_n'] or 0,
+                   "kind": "HOSTILE" if (r['hostile_n'] or 0) > (r['coop_n'] or 0) else "COOPERATIVE",
+                   "topics": _topics(r['topics']), "outlets": list(r['outlets'] or []), "last_seen": r['last_seen']} for r in pairs],
+    }}
+
 
 @router.get("/kg/events")
 async def list_events(from_: Optional[datetime] = Query(None, alias="from"), to: Optional[datetime] = None,
