@@ -468,7 +468,8 @@ async def get_entity_network(
         edges = []
         for _ in range(hops):
             rows = await conn.fetch("""
-                SELECT a_id, b_id, kind, source, label, event_count, weight, first_seen, last_seen, topics
+                SELECT a_id, b_id, kind, source, label, event_count, weight, first_seen, last_seen, topics,
+                       verified_count, wire_count, verified_topics
                 FROM relations
                 WHERE (a_id = ANY($1) OR b_id = ANY($1))
                   AND ($2::text[] IS NULL OR kind = ANY($2))
@@ -512,7 +513,8 @@ async def get_entity_network(
             "label": e['label'] or e['kind'].lower(), "confidence": round(min(1.0, float(e['weight'])), 3),
             "weight": round(float(e['weight']), 3), "event_count": e['event_count'],
             "outlets": outlets.get((e['a_id'], e['b_id']), []),
-            "topics": _top_topics(e['topics']),
+            "topics": _top_topics(e['topics']), "verified_topics": _top_topics(e['verified_topics']),
+            "verified_count": e['verified_count'], "wire_count": e['wire_count'],
             "first_seen": e['first_seen'], "last_seen": e['last_seen'], "reasoning": None,
         }
     return {"status": "success", "data": {"root": str(root['entity_id']), "nodes": list(node_map.values()), "links": list(dedup.values())}}

@@ -58,6 +58,7 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
         """, eid)
         rels = await conn.fetch("""
             SELECT r.kind, r.source, r.label, r.event_count, r.weight, r.first_seen, r.last_seen, r.directed, r.topics,
+                   r.verified_count, r.wire_count, r.verified_topics,
                    (r.a_id = $1) AS outgoing,
                    o.entity_id AS other_id, o.qid AS other_qid, o.name AS other_name, o.kind AS other_kind
             FROM relations r JOIN entities o ON o.entity_id = CASE WHEN r.a_id = $1 THEN r.b_id ELSE r.a_id END
@@ -87,7 +88,8 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
             "sources": extra.get("sources", []), "actions": extra.get("actions", []),
             "entity_id": str(r['other_id']), "qid": r['other_qid'], "name": r['other_name'], "kind": r['other_kind'],
             "label": r['label'], "source": r['source'], "event_count": r['event_count'], "weight": round(float(r['weight']), 3),
-            "topics": _topics(r['topics']),
+            "topics": _topics(r['topics']), "verified_topics": _topics(r['verified_topics']),
+            "verified_count": r['verified_count'], "wire_count": r['wire_count'],
             "first_seen": r['first_seen'], "last_seen": r['last_seen'], "direction": ("out" if r['outgoing'] else "in") if r['directed'] else None,
         })
     return {"status": "success", "data": {
@@ -151,17 +153,17 @@ async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200)
         ea, eb = await _find(conn, a), await _find(conn, b)
         if not ea or not eb:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Entity not found")
-        rels = await conn.fetch("SELECT kind, source, label, event_count, weight, first_seen, last_seen, topics FROM relations WHERE (a_id = $1 AND b_id = $2) OR (a_id = $2 AND b_id = $1)",
+        rels = await conn.fetch("SELECT kind, source, label, event_count, weight, first_seen, last_seen, topics, verified_count, wire_count, verified_topics FROM relations WHERE (a_id = $1 AND b_id = $2) OR (a_id = $2 AND b_id = $1)",
                                 ea['entity_id'], eb['entity_id'])
         evs = await conn.fetch("""
             SELECT ev.event_id, ev.event_time, ev.action, ev.kind, ev.topic, ev.code, ev.confidence, ev.quote, ev.source_id, ev.origin, ev.report_uid,
-                   u.content_headline, u.source_url,
+                   ev.outlets, u.content_headline, u.source_url,
                    CASE WHEN ev.origin = 'gdelt' THEN split_part(u.content_summary, ':', 1) END AS coded_as,
                    a.name AS actor, t.name AS target
             FROM events ev LEFT JOIN intelligence_records u ON u.uid = ev.report_uid
             LEFT JOIN entities a ON a.entity_id = ev.actor_id LEFT JOIN entities t ON t.entity_id = ev.target_id
             WHERE (ev.actor_id = $1 AND ev.target_id = $2) OR (ev.actor_id = $2 AND ev.target_id = $1)
-            ORDER BY ev.event_time DESC LIMIT $3
+            ORDER BY (ev.origin <> 'gdelt') DESC, ev.event_time DESC LIMIT $3
         """, ea['entity_id'], eb['entity_id'], limit)
         shared = await conn.fetch("""
             SELECT u.uid, u.content_headline, u.created_at, u.source_id FROM intelligence_records u
@@ -171,7 +173,7 @@ async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200)
         """, ea['entity_id'], eb['entity_id'])
     return {"status": "success", "data": {
         "a": _entity(ea), "b": _entity(eb),
-        "relations": [dict(r, topics=_topics(r['topics'])) for r in rels],
+        "relations": [dict(r, topics=_topics(r['topics']), verified_topics=_topics(r['verified_topics'])) for r in rels],
         "events": [dict(e, event_id=str(e['event_id']), report_uid=str(e['report_uid']) if e['report_uid'] else None) for e in evs],
         "shared_reports": [dict(s, uid=str(s['uid'])) for s in shared],
     }}
@@ -194,6 +196,8 @@ async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
             WITH pt AS (
                 SELECT LEAST(actor_id, target_id) AS a, GREATEST(actor_id, target_id) AS b, kind,
                        COUNT(*) AS n, MAX(event_time) AS last_seen,
+                       COUNT(*) FILTER (WHERE origin <> 'gdelt') AS n_verified,
+                       COUNT(*) FILTER (WHERE origin = 'gdelt' AND COALESCE(weight_class, 'material') = 'material') AS n_wire_deeds,
                        array_agg(DISTINCT COALESCE(source_id, origin)) AS outlets,
                        jsonb_object_agg(COALESCE(topic, 'other'), 1) AS _t
                 FROM events
@@ -210,6 +214,11 @@ async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
             )
             SELECT a, b,
                    SUM(n) AS event_count,
+                   SUM(n_verified) AS verified_count,
+                   SUM(n) - SUM(n_verified) AS wire_count,
+                   SUM(n_wire_deeds) AS wire_deeds,
+                   SUM(n_verified) FILTER (WHERE kind = 'HOSTILE') AS v_hostile_n,
+                   SUM(n_verified) FILTER (WHERE kind = 'COOPERATIVE') AS v_coop_n,
                    SUM(n) FILTER (WHERE kind = 'HOSTILE') AS hostile_n,
                    SUM(n) FILTER (WHERE kind = 'COOPERATIVE') AS coop_n,
                    MAX(last_seen) AS last_seen,
@@ -217,20 +226,28 @@ async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
                    (SELECT jsonb_object_agg(topic, n) FROM topics t WHERE t.a = pt.a AND t.b = pt.b) AS topics
             FROM pt
             GROUP BY a, b
-            HAVING SUM(n) >= $1
-            ORDER BY SUM(n) DESC
+            HAVING SUM(n_verified) >= 1 OR SUM(n_wire_deeds) >= $1
+            ORDER BY SUM(n_verified) DESC, SUM(n) DESC
             LIMIT $2
         """, min_events, limit)
         ids = list({r['a'] for r in pairs} | {r['b'] for r in pairs})
         nodes = await conn.fetch(f"""
             SELECT e.entity_id, e.qid, e.name, e.kind, e.country_qid,
-                   COALESCE(ST_Y(e.primary_geo), ST_Y(c.primary_geo)) AS lat,
-                   COALESCE(ST_X(e.primary_geo), ST_X(c.primary_geo)) AS lon,
-                   (e.primary_geo IS NULL AND c.primary_geo IS NOT NULL) AS orbits,
+                   -- a country sits at its current capital (Wikidata's own point for Russia is in Siberia);
+                   -- anything else at its own point, else beside its country
+                   COALESCE(ST_Y(cap.primary_geo), ST_Y(e.primary_geo), ST_Y(c.primary_geo)) AS lat,
+                   COALESCE(ST_X(cap.primary_geo), ST_X(e.primary_geo), ST_X(c.primary_geo)) AS lon,
+                   (e.primary_geo IS NULL AND cap.primary_geo IS NULL AND c.primary_geo IS NOT NULL) AS orbits,
                    c.entity_id AS country_id,
                    (SELECT COUNT(*) FROM events ev WHERE (ev.actor_id = e.entity_id OR ev.target_id = e.entity_id)
                        AND ev.event_time > NOW() - INTERVAL '{interval}') AS activity
-            FROM entities e LEFT JOIN entities c ON c.qid = e.country_qid AND c.kind = 'COUNTRY'
+            FROM entities e
+            LEFT JOIN entities c ON c.qid = e.country_qid AND c.kind = 'COUNTRY'
+            LEFT JOIN LATERAL (
+                SELECT k.primary_geo FROM relations r JOIN entities k ON k.entity_id = r.b_id
+                WHERE r.a_id = e.entity_id AND r.property = 'P36' AND e.kind = 'COUNTRY' AND k.primary_geo IS NOT NULL
+                ORDER BY r.weight DESC, k.sitelinks DESC LIMIT 1
+            ) cap ON TRUE
             WHERE e.entity_id = ANY($1)
         """, ids)
     return {"status": "success", "data": {
@@ -239,6 +256,8 @@ async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
                    "lat": n['lat'], "lon": n['lon'], "orbits": n['orbits'],
                    "country_id": str(n['country_id']) if n['country_id'] else None, "activity": n['activity']} for n in nodes],
         "links": [{"source": str(r['a']), "target": str(r['b']), "event_count": r['event_count'],
+                   "verified_count": r['verified_count'] or 0, "wire_count": r['wire_count'] or 0,
+                   "v_hostile_n": r['v_hostile_n'] or 0, "v_coop_n": r['v_coop_n'] or 0,
                    "hostile_n": r['hostile_n'] or 0, "coop_n": r['coop_n'] or 0,
                    "kind": "HOSTILE" if (r['hostile_n'] or 0) > (r['coop_n'] or 0) else "COOPERATIVE",
                    "topics": _topics(r['topics']), "outlets": list(r['outlets'] or []), "last_seen": r['last_seen']} for r in pairs],
