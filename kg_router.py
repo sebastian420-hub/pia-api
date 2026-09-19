@@ -69,12 +69,30 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
             WHERE m.entity_id = $1 ORDER BY u.created_at DESC LIMIT 20
         """, eid)
         event_counts = await conn.fetch("""
-            SELECT action, count(*) AS n FROM events WHERE actor_id = $1 OR target_id = $1
+            SELECT action, count(*) AS n FROM events WHERE (actor_id = $1 OR target_id = $1)
               AND event_time > NOW() - INTERVAL '90 days' GROUP BY action ORDER BY n DESC
         """, eid)
+        pair_sources = await conn.fetch("""
+            SELECT CASE WHEN actor_id = $1 THEN target_id ELSE actor_id END AS other_id,
+                   CASE action
+                     WHEN 'ATTACK' THEN 'HOSTILE' WHEN 'THREATEN' THEN 'HOSTILE' WHEN 'SANCTION' THEN 'HOSTILE'
+                     WHEN 'COERCE' THEN 'HOSTILE' WHEN 'ACCUSE' THEN 'HOSTILE' WHEN 'ARREST' THEN 'HOSTILE'
+                     WHEN 'PROTEST' THEN 'HOSTILE' WHEN 'REJECT' THEN 'HOSTILE'
+                     WHEN 'COOPERATE' THEN 'COOPERATIVE' WHEN 'AID' THEN 'COOPERATIVE' WHEN 'AGREE' THEN 'COOPERATIVE'
+                     WHEN 'MEET' THEN 'COOPERATIVE' WHEN 'VISIT' THEN 'COOPERATIVE' WHEN 'APPEAL' THEN 'COOPERATIVE'
+                     WHEN 'APPOINT' THEN 'ROLE' WHEN 'RESIGN' THEN 'ROLE' WHEN 'ELECT' THEN 'ROLE'
+                     WHEN 'ACQUIRE' THEN 'OWNERSHIP' WHEN 'INVEST' THEN 'OWNERSHIP' ELSE NULL END AS kind,
+                   array_agg(DISTINCT COALESCE(source_id, origin)) AS srcs,
+                   array_agg(DISTINCT action) AS actions
+            FROM events WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL
+            GROUP BY 1, 2
+        """, eid)
+    srcs_by_pair = {(r['other_id'], r['kind']): {"sources": list(r['srcs']), "actions": list(r['actions'])} for r in pair_sources}
     grouped: dict = {}
     for r in rels:
+        extra = srcs_by_pair.get((r['other_id'], r['kind']), {}) if r['source'] == 'events' else {}
         grouped.setdefault(r['kind'], []).append({
+            "sources": extra.get("sources", []), "actions": extra.get("actions", []),
             "entity_id": str(r['other_id']), "qid": r['other_qid'], "name": r['other_name'], "kind": r['other_kind'],
             "label": r['label'], "source": r['source'], "event_count": r['event_count'], "weight": round(float(r['weight']), 3),
             "first_seen": r['first_seen'], "last_seen": r['last_seen'], "direction": ("out" if r['outgoing'] else "in") if r['directed'] else None,

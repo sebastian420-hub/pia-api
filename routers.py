@@ -430,10 +430,20 @@ async def semantic_search(body: SemanticSearchRequest, pool: asyncpg.Pool = Depe
 async def get_entity_network(
     entity_name: str,
     hops: int = Query(1, ge=1, le=2),
-    min_weight: float = Query(0.05, ge=0),
+    kinds: Optional[str] = Query(None, description="csv of HOSTILE,COOPERATIVE,ROLE,OWNERSHIP,MEMBERSHIP,LOCATED,MENTIONED_WITH"),
+    sources: Optional[str] = Query(None, description="csv of events,wikidata,cooccurrence"),
+    min_events: int = Query(0, ge=0),
+    min_weight: float = Query(0.0, ge=0),
+    limit: int = Query(60, ge=1, le=400),
     pool: asyncpg.Pool = Depends(get_pool),
 ):
-    """Relations around an entity (computed from events + Wikidata). Nodes/links shape for the web view."""
+    """
+    Relations around an entity for the web view. Event-based edges rank above Wikidata facts,
+    facts above co-mentions; within a rank by weight. Each link carries its source, event count
+    and the outlets behind it, so the UI can draw facts dashed and write "27 attacks (bbc, gdelt)".
+    """
+    kind_list = [k.strip().upper() for k in kinds.split(",")] if kinds else None
+    source_list = [x.strip().lower() for x in sources.split(",")] if sources else None
     async with pool.acquire() as conn:
         root = await conn.fetchrow("""
             SELECT e.entity_id, e.qid, e.name, e.kind, e.description, e.mention_count
@@ -450,30 +460,52 @@ async def get_entity_network(
         for _ in range(hops):
             rows = await conn.fetch("""
                 SELECT a_id, b_id, kind, source, label, event_count, weight, first_seen, last_seen
-                FROM relations WHERE (a_id = ANY($1) OR b_id = ANY($1)) AND weight >= $2
-                ORDER BY weight DESC LIMIT 300
-            """, list(frontier), min_weight)
+                FROM relations
+                WHERE (a_id = ANY($1) OR b_id = ANY($1))
+                  AND ($2::text[] IS NULL OR kind = ANY($2))
+                  AND ($3::text[] IS NULL OR source = ANY($3))
+                  AND event_count >= $4 AND weight >= $5
+                ORDER BY CASE source WHEN 'events' THEN 0 WHEN 'wikidata' THEN 1 ELSE 2 END, weight DESC
+                LIMIT $6
+            """, list(frontier), kind_list, source_list, min_events, min_weight, limit)
             edges.extend(rows)
             nxt = {r['a_id'] for r in rows} | {r['b_id'] for r in rows}
             frontier = nxt - seen
             seen |= nxt
         nodes = await conn.fetch(
             "SELECT entity_id, qid, name, kind, description, mention_count FROM entities WHERE entity_id = ANY($1)", list(seen))
+        # outlets behind each event-based pair
+        pairs = [(e['a_id'], e['b_id']) for e in edges if e['source'] == 'events']
+        outlets = {}
+        if pairs:
+            rows = await conn.fetch("""
+                SELECT LEAST(actor_id, target_id) AS a, GREATEST(actor_id, target_id) AS b,
+                       array_agg(DISTINCT COALESCE(source_id, origin)) AS srcs
+                FROM events
+                WHERE actor_id IS NOT NULL AND target_id IS NOT NULL
+                  AND LEAST(actor_id, target_id) = ANY($1) AND GREATEST(actor_id, target_id) = ANY($2)
+                GROUP BY 1, 2
+            """, [p[0] for p in pairs], [p[1] for p in pairs])
+            outlets = {(r['a'], r['b']): list(r['srcs']) for r in rows}
+
     node_map = {str(n['entity_id']): {"id": str(n['entity_id']), "qid": n['qid'], "name": n['name'], "group": n['kind'],
-                                      "description": n['description'], "val": max(3, min(30, 3 + (n['mention_count'] or 0)))}
+                                      "description": n['description'], "mentions": n['mention_count'] or 0,
+                                      "val": max(3, min(24, 3 + (n['mention_count'] or 0) ** 0.5)), "is_root": False}
                 for n in nodes}
-    node_map[str(root['entity_id'])]["val"] = 30
+    node_map[str(root['entity_id'])].update({"is_root": True, "val": 26})
     dedup = {}
     for e in edges:
         key = (str(e['a_id']), str(e['b_id']), e['kind'], e['source'])
         if key in dedup:
             continue
         dedup[key] = {
-            "source": str(e['a_id']), "target": str(e['b_id']), "label": f"{e['kind'].lower()} · {e['label'] or e['source']}",
-            "kind": e['kind'], "origin": e['source'], "confidence": round(min(1.0, float(e['weight'])), 3),
-            "event_count": e['event_count'], "first_seen": e['first_seen'], "last_seen": e['last_seen'], "reasoning": None,
+            "source": str(e['a_id']), "target": str(e['b_id']), "kind": e['kind'], "origin": e['source'],
+            "label": e['label'] or e['kind'].lower(), "confidence": round(min(1.0, float(e['weight'])), 3),
+            "weight": round(float(e['weight']), 3), "event_count": e['event_count'],
+            "outlets": outlets.get((e['a_id'], e['b_id']), []),
+            "first_seen": e['first_seen'], "last_seen": e['last_seen'], "reasoning": None,
         }
-    return {"status": "success", "data": {"nodes": list(node_map.values()), "links": list(dedup.values())}}
+    return {"status": "success", "data": {"root": str(root['entity_id']), "nodes": list(node_map.values()), "links": list(dedup.values())}}
 
 
 # ═══════════════════════════════════════════════════════════
