@@ -62,7 +62,11 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
                    (r.a_id = $1) AS outgoing,
                    o.entity_id AS other_id, o.qid AS other_qid, o.name AS other_name, o.kind AS other_kind
             FROM relations r JOIN entities o ON o.entity_id = CASE WHEN r.a_id = $1 THEN r.b_id ELSE r.a_id END
-            WHERE (r.a_id = $1 OR r.b_id = $1) ORDER BY r.weight DESC LIMIT 200
+            WHERE (r.a_id = $1 OR r.b_id = $1)
+            -- observed relations first (they are few and matter most), then facts and co-mentions;
+            -- a country's 200 "located in" facts must never crowd out its 7 hostile relations
+            ORDER BY CASE r.source WHEN 'events' THEN 0 WHEN 'wikidata' THEN 1 ELSE 2 END, r.verified_count DESC, r.weight DESC
+            LIMIT 300
         """, eid)
         reports = await conn.fetch("""
             SELECT m.report_uid, m.role, m.surface, u.content_headline, u.created_at, u.source_id, u.priority
@@ -363,6 +367,7 @@ async def review_queue(limit: int = Query(50, ge=1, le=200), pool: asyncpg.Pool 
             FROM entities e WHERE e.resolution = 'NEEDS_REVIEW'
             ORDER BY e.mention_count DESC, e.created_at DESC LIMIT $1
         """, limit)
+        total = await conn.fetchval("SELECT COUNT(*) FROM entities WHERE resolution = 'NEEDS_REVIEW'")
         cands = {}
         metas = {str(r['entity_id']): (json.loads(r['metadata']) if isinstance(r['metadata'], str) else (r['metadata'] or {})) for r in rows}
         for r in rows:
@@ -388,7 +393,7 @@ async def review_queue(limit: int = Query(50, ge=1, le=200), pool: asyncpg.Pool 
             "candidates": [cands.get(q) or {"qid": q} for q in (meta.get('candidates') or [])[:5]],
             "examples": (json.loads(r['examples']) if isinstance(r['examples'], str) else r['examples']) or [],
         })
-    return {"status": "success", "data": out}
+    return {"status": "success", "data": out, "total": total}
 
 
 @router.post("/kg/review/{entity_id}")
