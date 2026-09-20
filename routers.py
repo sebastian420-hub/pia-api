@@ -18,7 +18,7 @@ logger = logging.getLogger("pia-api")
 router = APIRouter(dependencies=[Depends(require_token)])
 
 DEFAULT_CLIENT_ID = uuid.UUID("00000000-0000-0000-0000-000000000000")
-ALLOWED_UPLOAD_EXT = {".pdf", ".txt"}
+ALLOWED_UPLOAD_EXT = {".pdf", ".txt", ".md", ".json"}
 
 
 def get_pool(request: Request) -> asyncpg.Pool:
@@ -129,7 +129,7 @@ async def upload_document(file: UploadFile = File(...)):
     original = os.path.basename(file.filename or "")
     ext = os.path.splitext(original)[1].lower()
     if ext not in ALLOWED_UPLOAD_EXT:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Only .pdf and .txt files are accepted")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Only .pdf, .txt, .md and .json files are accepted")
 
     # Never trust the client's filename as a path: sanitise and prefix a random id.
     stem = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.splitext(original)[0])[:100] or "document"

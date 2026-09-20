@@ -89,11 +89,14 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
         """, eid)
         # the strongest verified event per (other, kind): the words and the quote the connection rests on
         whys = await conn.fetch("""
-            SELECT DISTINCT ON (other_id, kind) other_id, kind, predicate, action, quote, modality, verifier_verdict, source_id, event_time,
+            SELECT DISTINCT ON (other_id, kind) other_id, kind, predicate, action, quote, modality, source_id, event_time, origin,
+                   -- a structured row (connector, human report) was never sent to the verifier: it is "recorded", not "verified"
+                   CASE WHEN origin = 'connector' THEN 'recorded' ELSE verifier_verdict END AS verifier_verdict,
                    (actor_id = $1) AS outgoing
             FROM (SELECT CASE WHEN actor_id = $1 THEN target_id ELSE actor_id END AS other_id, * FROM events
-                  WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL AND origin = 'llm') x
-            ORDER BY other_id, kind, (verifier_verdict = 'yes') DESC, (modality = 'asserted') DESC, confidence DESC, event_time DESC
+                  WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL
+                    AND origin IN ('llm', 'connector')) x
+            ORDER BY other_id, kind, (verifier_verdict = 'yes' OR origin = 'connector') DESC, (modality = 'asserted') DESC, confidence DESC, event_time DESC
         """, eid)
         brief = await conn.fetchrow("SELECT text, generated_at FROM entity_briefs WHERE entity_id = $1", eid)
         ext_ids = await conn.fetch("SELECT source_id, external_id, kind FROM external_ids WHERE entity_id = $1 ORDER BY source_id, kind LIMIT 40", eid)
@@ -101,7 +104,7 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
             SELECT ev.event_id, ev.event_time, ev.kind, ev.stance, ev.modality, ev.verifier_verdict, COALESCE(ev.predicate, ev.action) AS predicate,
                    a.name AS actor, t.name AS target, ev.quote, ev.source_id, ev.origin
             FROM events ev JOIN entities a ON a.entity_id = ev.actor_id LEFT JOIN entities t ON t.entity_id = ev.target_id
-            WHERE (ev.actor_id = $1 OR ev.target_id = $1) AND ev.origin = 'llm' AND ev.event_time > NOW() - INTERVAL '30 days'
+            WHERE (ev.actor_id = $1 OR ev.target_id = $1) AND ev.origin IN ('llm', 'connector') AND ev.event_time > NOW() - INTERVAL '30 days'
             ORDER BY ev.event_time DESC LIMIT 120
         """, eid)
     srcs_by_pair = {(r['other_id'], r['kind']): {"sources": list(r['srcs']), "actions": list(r['actions'])} for r in pair_sources}
@@ -243,7 +246,8 @@ async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200)
                                 ea['entity_id'], eb['entity_id'])
         evs = await conn.fetch("""
             SELECT ev.event_id, ev.event_time, ev.action, ev.kind, ev.topic, ev.code, ev.confidence, ev.quote, ev.source_id, ev.origin, ev.report_uid,
-                   ev.outlets, ev.predicate, ev.stance, ev.modality, ev.polarity, ev.verifier_verdict, ev.verifier_note,
+                   ev.outlets, ev.predicate, ev.stance, ev.modality, ev.polarity, ev.verifier_note, ev.record_ref,
+                   CASE WHEN ev.origin = 'connector' THEN 'recorded' ELSE ev.verifier_verdict END AS verifier_verdict,
                    u.content_headline, u.source_url,
                    CASE WHEN ev.origin = 'gdelt' THEN split_part(u.content_summary, ':', 1) END AS coded_as,
                    a.name AS actor, t.name AS target
