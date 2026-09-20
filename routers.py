@@ -484,10 +484,21 @@ async def get_entity_network(
             seen |= nxt
         nodes = await conn.fetch(
             "SELECT entity_id, qid, name, kind, description, mention_count FROM entities WHERE entity_id = ANY($1)", list(seen))
-        # outlets behind each event-based pair
+        # outlets behind each event-based pair, and the words of the strongest verified event per (pair, kind)
         pairs = [(e['a_id'], e['b_id']) for e in edges if e['source'] == 'events']
         outlets = {}
+        whys = {}
         if pairs:
+            wrows = await conn.fetch("""
+                SELECT DISTINCT ON (a, b, kind) a, b, kind, predicate, action, quote, modality, verifier_verdict, actor_id
+                FROM (SELECT LEAST(actor_id, target_id) AS a, GREATEST(actor_id, target_id) AS b, * FROM events
+                      WHERE origin = 'llm' AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL
+                        AND LEAST(actor_id, target_id) = ANY($1) AND GREATEST(actor_id, target_id) = ANY($2)) x
+                ORDER BY a, b, kind, (verifier_verdict = 'yes') DESC, (modality = 'asserted') DESC, confidence DESC, event_time DESC
+            """, [p[0] for p in pairs], [p[1] for p in pairs])
+            whys = {(r['a'], r['b'], r['kind']): {"predicate": r['predicate'] or (r['action'] or '').lower().replace('_', ' '),
+                                                  "quote": r['quote'], "modality": r['modality'], "verdict": r['verifier_verdict'],
+                                                  "actor_id": str(r['actor_id'])} for r in wrows}
             rows = await conn.fetch("""
                 SELECT LEAST(actor_id, target_id) AS a, GREATEST(actor_id, target_id) AS b,
                        array_agg(DISTINCT COALESCE(source_id, origin)) AS srcs
@@ -515,6 +526,7 @@ async def get_entity_network(
             "outlets": outlets.get((e['a_id'], e['b_id']), []),
             "topics": _top_topics(e['topics']), "verified_topics": _top_topics(e['verified_topics']),
             "verified_count": e['verified_count'], "wire_count": e['wire_count'],
+            "why": whys.get((e['a_id'], e['b_id'], e['kind'])),
             "first_seen": e['first_seen'], "last_seen": e['last_seen'], "reasoning": None,
         }
     return {"status": "success", "data": {"root": str(root['entity_id']), "nodes": list(node_map.values()), "links": list(dedup.values())}}

@@ -84,12 +84,32 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
             FROM events WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL
             GROUP BY 1, 2
         """, eid)
+        # the strongest verified event per (other, kind): the words and the quote the connection rests on
+        whys = await conn.fetch("""
+            SELECT DISTINCT ON (other_id, kind) other_id, kind, predicate, action, quote, modality, verifier_verdict, source_id, event_time,
+                   (actor_id = $1) AS outgoing
+            FROM (SELECT CASE WHEN actor_id = $1 THEN target_id ELSE actor_id END AS other_id, * FROM events
+                  WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL AND origin = 'llm') x
+            ORDER BY other_id, kind, (verifier_verdict = 'yes') DESC, (modality = 'asserted') DESC, confidence DESC, event_time DESC
+        """, eid)
+        brief = await conn.fetchrow("SELECT text, generated_at FROM entity_briefs WHERE entity_id = $1", eid)
+        timeline = await conn.fetch("""
+            SELECT ev.event_id, ev.event_time, ev.kind, ev.stance, ev.modality, ev.verifier_verdict, COALESCE(ev.predicate, ev.action) AS predicate,
+                   a.name AS actor, t.name AS target, ev.quote, ev.source_id, ev.origin
+            FROM events ev JOIN entities a ON a.entity_id = ev.actor_id LEFT JOIN entities t ON t.entity_id = ev.target_id
+            WHERE (ev.actor_id = $1 OR ev.target_id = $1) AND ev.origin = 'llm' AND ev.event_time > NOW() - INTERVAL '30 days'
+            ORDER BY ev.event_time DESC LIMIT 120
+        """, eid)
     srcs_by_pair = {(r['other_id'], r['kind']): {"sources": list(r['srcs']), "actions": list(r['actions'])} for r in pair_sources}
+    why_by_pair = {(w['other_id'], w['kind']): {"predicate": w['predicate'] or (w['action'] or '').lower().replace('_', ' '),
+                                                 "quote": w['quote'], "modality": w['modality'], "verdict": w['verifier_verdict'],
+                                                 "outlet": w['source_id'], "when": w['event_time'], "outgoing": w['outgoing']} for w in whys}
     grouped: dict = {}
     for r in rels:
         extra = srcs_by_pair.get((r['other_id'], r['kind']), {}) if r['source'] == 'events' else {}
         grouped.setdefault(r['kind'], []).append({
             "sources": extra.get("sources", []), "actions": extra.get("actions", []),
+            "why": why_by_pair.get((r['other_id'], r['kind'])) if r['source'] == 'events' else None,
             "entity_id": str(r['other_id']), "qid": r['other_qid'], "name": r['other_name'], "kind": r['other_kind'],
             "label": r['label'], "source": r['source'], "event_count": r['event_count'], "weight": round(float(r['weight']), 3),
             "topics": _topics(r['topics']), "verified_topics": _topics(r['verified_topics']),
@@ -101,6 +121,8 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
         "aliases": [dict(a) for a in aliases],
         "trend": dict(trend) if trend else None,
         "relations": grouped,
+        "brief": {"text": brief['text'], "generated_at": brief['generated_at']} if brief else None,
+        "timeline": [dict(t, event_id=str(t['event_id'])) for t in timeline],
         "event_counts": {r['action']: r['n'] for r in event_counts},
         "recent_reports": [dict(r, report_uid=str(r['report_uid'])) for r in reports],
         "wikidata_url": f"https://www.wikidata.org/wiki/{e['qid']}" if e['qid'] else None,
@@ -142,6 +164,59 @@ def _event(r) -> dict:
     return d
 
 
+@router.get("/kg/verbs")
+async def list_verbs(status_filter: Optional[str] = Query(None, alias="status"), days: int = Query(30, ge=1, le=365),
+                     pool: asyncpg.Pool = Depends(get_pool)):
+    """The living verb catalogue: families with their verbs; `status=auto` = new ones the model created."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT verb_id, verb, family, default_stance, status, seen_count, examples, created_by, created_at,
+                   (SELECT array_agg(alias) FROM verb_aliases a WHERE a.verb_id = v.verb_id) AS aliases
+            FROM verbs v
+            WHERE status <> 'merged' AND ($1::text IS NULL OR status = $1) AND created_at > NOW() - make_interval(days => $2)
+               OR ($1::text IS NULL AND status IN ('seed','curated'))
+            ORDER BY family, seen_count DESC, verb
+        """, status_filter, days)
+    return {"status": "success", "data": [dict(r, verb_id=str(r['verb_id']), examples=json.loads(r['examples']) if isinstance(r['examples'], str) else r['examples'], aliases=list(r['aliases'] or [])) for r in rows]}
+
+
+class VerbEdit(BaseModel):
+    action: str = Field(pattern="^(rename|move|stance|merge|reject|approve)$")
+    verb: Optional[str] = Field(None, max_length=80)
+    family: Optional[str] = Field(None, max_length=40)
+    default_stance: Optional[int] = Field(None, ge=-3, le=3)
+    into: Optional[uuid.UUID] = None
+
+
+@router.post("/kg/verbs/{verb_id}")
+async def edit_verb(verb_id: uuid.UUID, body: VerbEdit, pool: asyncpg.Pool = Depends(get_pool)):
+    """Curate a verb: rename, move to another family, set its default stance, merge into another, reject, approve."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT verb_id, verb, family FROM verbs WHERE verb_id = $1", verb_id)
+        if not row:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown verb")
+        if body.action == "rename" and body.verb:
+            await conn.execute("INSERT INTO verb_aliases (alias, verb_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", row['verb'], verb_id)
+            await conn.execute("UPDATE verbs SET verb = $2, status = 'curated', updated_at = NOW() WHERE verb_id = $1", verb_id, body.verb.strip().lower())
+        elif body.action == "move" and body.family:
+            await conn.execute("UPDATE verbs SET family = $2, status = 'curated', updated_at = NOW() WHERE verb_id = $1", verb_id, body.family)
+            await conn.execute("UPDATE events SET family = $2 WHERE verb_id = $1", verb_id, body.family)
+        elif body.action == "stance" and body.default_stance is not None:
+            await conn.execute("UPDATE verbs SET default_stance = $2, status = 'curated', updated_at = NOW() WHERE verb_id = $1", verb_id, body.default_stance)
+        elif body.action == "merge" and body.into:
+            await conn.execute("INSERT INTO verb_aliases (alias, verb_id) VALUES ($1, $2) ON CONFLICT (alias) DO UPDATE SET verb_id = EXCLUDED.verb_id", row['verb'], body.into)
+            await conn.execute("UPDATE verb_aliases SET verb_id = $2 WHERE verb_id = $1", verb_id, body.into)
+            await conn.execute("UPDATE events SET verb_id = $2 WHERE verb_id = $1", verb_id, body.into)
+            await conn.execute("UPDATE verbs SET status = 'merged', merged_into = $2, updated_at = NOW() WHERE verb_id = $1", verb_id, body.into)
+        elif body.action == "reject":
+            await conn.execute("UPDATE verbs SET status = 'rejected', updated_at = NOW() WHERE verb_id = $1", verb_id)
+        elif body.action == "approve":
+            await conn.execute("UPDATE verbs SET status = 'curated', updated_at = NOW() WHERE verb_id = $1", verb_id)
+        else:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Nothing to do")
+    return {"status": "success", "data": {"verb_id": str(verb_id), "action": body.action}}
+
+
 def _topics(raw, top: int = 3):
     """relations.topics jsonb ({"diplomacy": 26, ...}) → [{"topic", "count"}] sorted, top N."""
     if not raw:
@@ -161,7 +236,8 @@ async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200)
                                 ea['entity_id'], eb['entity_id'])
         evs = await conn.fetch("""
             SELECT ev.event_id, ev.event_time, ev.action, ev.kind, ev.topic, ev.code, ev.confidence, ev.quote, ev.source_id, ev.origin, ev.report_uid,
-                   ev.outlets, u.content_headline, u.source_url,
+                   ev.outlets, ev.predicate, ev.stance, ev.modality, ev.polarity, ev.verifier_verdict, ev.verifier_note,
+                   u.content_headline, u.source_url,
                    CASE WHEN ev.origin = 'gdelt' THEN split_part(u.content_summary, ':', 1) END AS coded_as,
                    a.name AS actor, t.name AS target
             FROM events ev LEFT JOIN intelligence_records u ON u.uid = ev.report_uid
