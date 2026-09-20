@@ -13,12 +13,15 @@ from routers import get_pool
 
 router = APIRouter(dependencies=[Depends(require_token)])
 
-ENTITY_COLS = "entity_id, qid, kind, name, description, resolution, origin, country_qid, sitelinks, mention_count, first_seen, last_seen, watch_status, threat_score, ST_Y(primary_geo) AS lat, ST_X(primary_geo) AS lon"
+ENTITY_COLS = "entity_id, qid, kind, name, description, resolution, origin, country_qid, sitelinks, mention_count, first_seen, last_seen, watch_status, threat_score, ST_Y(primary_geo) AS lat, ST_X(primary_geo) AS lon, listings, properties"
 
 
 def _entity(r) -> dict:
     d = dict(r)
     d["entity_id"] = str(d["entity_id"])
+    for k in ("listings", "properties"):
+        if k in d and isinstance(d[k], str):
+            d[k] = json.loads(d[k])
     lat, lon = d.pop("lat", None), d.pop("lon", None)
     d["geo"] = {"lat": lat, "lon": lon} if lat is not None and lon is not None else None
     return d
@@ -58,14 +61,14 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
         """, eid)
         rels = await conn.fetch("""
             SELECT r.kind, r.source, r.label, r.event_count, r.weight, r.first_seen, r.last_seen, r.directed, r.topics,
-                   r.verified_count, r.wire_count, r.verified_topics,
+                   r.verified_count, r.wire_count, r.verified_topics, r.via_source, r.record_ref, r.properties AS rel_props,
                    (r.a_id = $1) AS outgoing,
                    o.entity_id AS other_id, o.qid AS other_qid, o.name AS other_name, o.kind AS other_kind
             FROM relations r JOIN entities o ON o.entity_id = CASE WHEN r.a_id = $1 THEN r.b_id ELSE r.a_id END
             WHERE (r.a_id = $1 OR r.b_id = $1)
             -- observed relations first (they are few and matter most), then facts and co-mentions;
             -- a country's 200 "located in" facts must never crowd out its 7 hostile relations
-            ORDER BY CASE r.source WHEN 'events' THEN 0 WHEN 'wikidata' THEN 1 ELSE 2 END, r.verified_count DESC, r.weight DESC
+            ORDER BY CASE r.source WHEN 'events' THEN 0 WHEN 'connector' THEN 1 WHEN 'wikidata' THEN 2 ELSE 3 END, r.verified_count DESC, r.weight DESC
             LIMIT 300
         """, eid)
         reports = await conn.fetch("""
@@ -93,6 +96,7 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
             ORDER BY other_id, kind, (verifier_verdict = 'yes') DESC, (modality = 'asserted') DESC, confidence DESC, event_time DESC
         """, eid)
         brief = await conn.fetchrow("SELECT text, generated_at FROM entity_briefs WHERE entity_id = $1", eid)
+        ext_ids = await conn.fetch("SELECT source_id, external_id, kind FROM external_ids WHERE entity_id = $1 ORDER BY source_id, kind LIMIT 40", eid)
         timeline = await conn.fetch("""
             SELECT ev.event_id, ev.event_time, ev.kind, ev.stance, ev.modality, ev.verifier_verdict, COALESCE(ev.predicate, ev.action) AS predicate,
                    a.name AS actor, t.name AS target, ev.quote, ev.source_id, ev.origin
@@ -114,6 +118,8 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
             "label": r['label'], "source": r['source'], "event_count": r['event_count'], "weight": round(float(r['weight']), 3),
             "topics": _topics(r['topics']), "verified_topics": _topics(r['verified_topics']),
             "verified_count": r['verified_count'], "wire_count": r['wire_count'],
+            "via_source": r['via_source'], "record_ref": r['record_ref'],
+            "properties": (json.loads(r['rel_props']) if isinstance(r['rel_props'], str) else r['rel_props']) if r['source'] == 'connector' else None,
             "first_seen": r['first_seen'], "last_seen": r['last_seen'], "direction": ("out" if r['outgoing'] else "in") if r['directed'] else None,
         })
     return {"status": "success", "data": {
@@ -122,6 +128,7 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
         "trend": dict(trend) if trend else None,
         "relations": grouped,
         "brief": {"text": brief['text'], "generated_at": brief['generated_at']} if brief else None,
+        "external_ids": [dict(x) for x in ext_ids],
         "timeline": [dict(t, event_id=str(t['event_id'])) for t in timeline],
         "event_counts": {r['action']: r['n'] for r in event_counts},
         "recent_reports": [dict(r, report_uid=str(r['report_uid'])) for r in reports],

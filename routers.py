@@ -469,13 +469,13 @@ async def get_entity_network(
         for _ in range(hops):
             rows = await conn.fetch("""
                 SELECT a_id, b_id, kind, source, label, event_count, weight, first_seen, last_seen, topics,
-                       verified_count, wire_count, verified_topics
+                       verified_count, wire_count, verified_topics, via_source
                 FROM relations
                 WHERE (a_id = ANY($1) OR b_id = ANY($1))
                   AND ($2::text[] IS NULL OR kind = ANY($2))
                   AND ($3::text[] IS NULL OR source = ANY($3))
                   AND event_count >= $4 AND weight >= $5
-                ORDER BY CASE source WHEN 'events' THEN 0 WHEN 'wikidata' THEN 1 ELSE 2 END, weight DESC
+                ORDER BY CASE source WHEN 'events' THEN 0 WHEN 'connector' THEN 1 WHEN 'wikidata' THEN 2 ELSE 3 END, weight DESC
                 LIMIT $6
             """, list(frontier), kind_list, source_list, min_events, min_weight, limit)
             edges.extend(rows)
@@ -527,6 +527,7 @@ async def get_entity_network(
             "topics": _top_topics(e['topics']), "verified_topics": _top_topics(e['verified_topics']),
             "verified_count": e['verified_count'], "wire_count": e['wire_count'],
             "why": whys.get((e['a_id'], e['b_id'], e['kind'])),
+            "via_source": e['via_source'],
             "first_seen": e['first_seen'], "last_seen": e['last_seen'], "reasoning": None,
         }
     return {"status": "success", "data": {"root": str(root['entity_id']), "nodes": list(node_map.values()), "links": list(dedup.values())}}
