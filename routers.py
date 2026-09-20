@@ -240,20 +240,26 @@ async def get_system_logs(pool: asyncpg.Pool = Depends(get_pool)):
 async def get_intelligence_archive(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
+    mission_id: Optional[uuid.UUID] = None,
     pool: asyncpg.Pool = Depends(get_pool),
 ):
-    """Paginated historical records. Includes lat/lon so the globe can show history on load."""
+    """Paginated historical records. Includes lat/lon so the globe can show history on load.
+    With `mission_id`, only what that mission scored relevant (alerts always)."""
+    from missions_router import mission_filter
     offset = (page - 1) * limit
+    where = f"""WHERE (COALESCE(metadata->>'skip_analysis', 'false') <> 'true' OR COALESCE(metadata->>'alert', 'false') = 'true')
+                  AND (source_agent <> 'mission_alerts' OR $3::uuid IS NULL OR mission_id = $3)
+                  {mission_filter(mission_id, 'report', 'uid', '$3')}"""
     async with pool.acquire() as conn:
-        records = await conn.fetch("""
+        records = await conn.fetch(f"""
             SELECT uid, created_at, source_type, priority, domain, content_headline, content_summary, entities,
-                   ST_Y(geo) as lat, ST_X(geo) as lon
+                   ST_Y(geo) as lat, ST_X(geo) as lon, mission_id, COALESCE(metadata->>'alert', 'false') = 'true' AS alert
             FROM intelligence_records
-            WHERE COALESCE(metadata->>'skip_analysis', 'false') <> 'true'
+            {where}
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2;
-        """, limit, offset)
-        total = await conn.fetchval("SELECT count(*) FROM intelligence_records WHERE COALESCE(metadata->>'skip_analysis', 'false') <> 'true';")
+        """, limit, offset, mission_id)
+        total = await conn.fetchval(f"SELECT count(*) FROM intelligence_records {where.replace('$3', '$1')}", mission_id)
 
     data = []
     for r in records:
@@ -300,10 +306,11 @@ async def get_entities_by_bbox(
     minLon: float = Query(..., ge=-180, le=180),
     maxLat: float = Query(..., ge=-90, le=90),
     maxLon: float = Query(..., ge=-180, le=540),
+    mission_id: Optional[uuid.UUID] = None,
     pool: asyncpg.Pool = Depends(get_pool),
 ):
     """
-    Watched entities inside the viewport. The UI sends maxLon > 180 when the view
+    Watched entities inside the viewport (only the mission's, when one is given). The UI sends maxLon > 180 when the view
     crosses the antimeridian; that case is split into two envelopes.
     """
     if maxLat < minLat:
@@ -319,6 +326,7 @@ async def get_entities_by_bbox(
     where = " OR ".join(
         f"primary_geo && ST_MakeEnvelope(${i*4+1}, ${i*4+2}, ${i*4+3}, ${i*4+4}, 4326)" for i in range(len(envelopes))
     )
+    from missions_router import mission_filter
     args = [v for env in envelopes for v in env]
     async with pool.acquire() as conn:
         records = await conn.fetch(f"""
@@ -326,9 +334,10 @@ async def get_entities_by_bbox(
                    threat_score, ST_Y(primary_geo) as lat, ST_X(primary_geo) as lon
             FROM entities
             WHERE primary_geo IS NOT NULL AND watch_status != 'PASSIVE' AND ({where})
+              {mission_filter(mission_id, 'entity', 'entities.entity_id', f'${len(args) + 1}')}
             ORDER BY threat_score DESC
             LIMIT 500;
-        """, *args)
+        """, *args, mission_id)
     return {"status": "success", "data": _format_geo_entities(records)}
 
 

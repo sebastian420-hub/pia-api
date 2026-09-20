@@ -14,6 +14,7 @@ from auth import ws_token_ok
 from routers import router as api_router
 from sensors_router import router as sensors_router, live_session_reaper
 from kg_router import router as kg_router
+from missions_router import router as missions_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("pia-api")
@@ -97,6 +98,7 @@ app.add_middleware(
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(sensors_router, prefix="/api/v1")
 app.include_router(kg_router, prefix="/api/v1")
+app.include_router(missions_router, prefix="/api/v1")
 
 
 # The UI checks `status === 'success'` and shows `message` otherwise, so error

@@ -271,13 +271,15 @@ WINDOWS = {"24h": "24 hours", "7d": "7 days", "30d": "30 days", "90d": "90 days"
 @router.get("/kg/web/overview")
 async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
                        min_events: int = Query(3, ge=1), limit: int = Query(400, ge=10, le=2000),
-                       pool: asyncpg.Pool = Depends(get_pool)):
+                       mission_id: Optional[uuid.UUID] = None, pool: asyncpg.Pool = Depends(get_pool)):
     """
-    The web from far away, for the globe: every entity that acted (or was acted on) in the
+    The web from far away, for the globe (only the mission's events, when one is given): every entity that acted (or was acted on) in the
     window, with its position (own, or its country's), its activity, and the strongest pairs
     between them — one link per pair, with the hostile and cooperative counts side by side.
     """
+    from missions_router import mission_filter
     interval = WINDOWS[window]
+    mf = mission_filter(mission_id, 'event', 'events.event_id', '$3')
     async with pool.acquire() as conn:
         pairs = await conn.fetch(f"""
             WITH pt AS (
@@ -290,6 +292,7 @@ async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
                 FROM events
                 WHERE actor_id IS NOT NULL AND target_id IS NOT NULL AND actor_id <> target_id
                   AND kind IN ('HOSTILE', 'COOPERATIVE') AND event_time > NOW() - INTERVAL '{interval}'
+                  {mf}
                 GROUP BY 1, 2, 3
             ), topics AS (
                 SELECT LEAST(actor_id, target_id) AS a, GREATEST(actor_id, target_id) AS b,
@@ -297,6 +300,7 @@ async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
                 FROM events
                 WHERE actor_id IS NOT NULL AND target_id IS NOT NULL AND actor_id <> target_id
                   AND kind IN ('HOSTILE', 'COOPERATIVE') AND event_time > NOW() - INTERVAL '{interval}'
+                  {mf}
                 GROUP BY 1, 2, 3
             )
             SELECT a, b,
@@ -316,7 +320,7 @@ async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
             HAVING SUM(n_verified) >= 1 OR SUM(n_wire_deeds) >= $1
             ORDER BY SUM(n_verified) DESC, SUM(n) DESC
             LIMIT $2
-        """, min_events, limit)
+        """, min_events, limit, mission_id)
         ids = list({r['a'] for r in pairs} | {r['b'] for r in pairs})
         nodes = await conn.fetch(f"""
             SELECT e.entity_id, e.qid, e.name, e.kind, e.country_qid,
@@ -355,8 +359,10 @@ async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
 async def list_events(from_: Optional[datetime] = Query(None, alias="from"), to: Optional[datetime] = None,
                       action: Optional[str] = None, min_confidence: float = Query(0.5, ge=0, le=1),
                       minLat: Optional[float] = None, minLon: Optional[float] = None, maxLat: Optional[float] = None, maxLon: Optional[float] = None,
-                      limit: int = Query(500, ge=1, le=5000), pool: asyncpg.Pool = Depends(get_pool)):
-    """Events for the globe / timeline."""
+                      limit: int = Query(500, ge=1, le=5000), mission_id: Optional[uuid.UUID] = None,
+                      pool: asyncpg.Pool = Depends(get_pool)):
+    """Events for the globe / timeline (only the mission's, when one is given)."""
+    from missions_router import mission_filter
     bbox = None not in (minLat, minLon, maxLat, maxLon)
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"""
@@ -369,9 +375,10 @@ async def list_events(from_: Optional[datetime] = Query(None, alias="from"), to:
             WHERE ev.confidence >= $1
               AND ($2::timestamptz IS NULL OR ev.event_time >= $2) AND ($3::timestamptz IS NULL OR ev.event_time <= $3)
               AND ($4::text IS NULL OR ev.action = $4)
-              {"AND ev.geo && ST_MakeEnvelope($6, $7, $8, $9, 4326)" if bbox else ""}
+              {mission_filter(mission_id, 'event', 'ev.event_id', '$6')}
+              {"AND ev.geo && ST_MakeEnvelope($7, $8, $9, $10, 4326)" if bbox else ""}
             ORDER BY ev.event_time DESC LIMIT $5
-        """, min_confidence, from_, to, action, limit, *([minLon, minLat, maxLon, maxLat] if bbox else []))
+        """, min_confidence, from_, to, action, limit, mission_id, *([minLon, minLat, maxLon, maxLat] if bbox else []))
     return {"status": "success", "data": [_event(r) for r in rows]}
 
 
