@@ -202,11 +202,12 @@ async def get_event_details(uid: uuid.UUID, pool: asyncpg.Pool = Depends(get_poo
     }
 
 
-@router.get("/logs", dependencies=[Depends(require_admin)])
-async def get_system_logs(pool: asyncpg.Pool = Depends(get_pool)):
-    """Latest agent activity across the queue and the ingestors, for the UI terminal."""
+@router.get("/logs")
+async def get_system_logs(pool: asyncpg.Pool = Depends(get_pool), vis: Visibility = Depends(visibility)):
+    """Latest agent activity across the queue and the ingestors, for the UI terminal. Any signed-in user;
+    headlines from restricted sources are left out for those not granted."""
     async with pool.acquire() as conn:
-        records = await conn.fetch("""
+        records = await conn.fetch(f"""
             SELECT created_at, agent, action, message, status
             FROM (
                 SELECT created_at,
@@ -222,7 +223,7 @@ async def get_system_logs(pool: asyncpg.Pool = Depends(get_pool)):
                        content_headline as message,
                        'DONE' as status
                 FROM intelligence_records
-                WHERE COALESCE(metadata->>'skip_analysis', 'false') <> 'true'
+                WHERE COALESCE(metadata->>'skip_analysis', 'false') <> 'true' {vis.sql('source_id')}
             ) combined_logs
             ORDER BY created_at DESC
             LIMIT 30;

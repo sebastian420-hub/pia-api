@@ -5,6 +5,7 @@ The snapshot proxy is the only way the browser gets camera images: it hides upst
 URLs, avoids CORS problems, caches for the camera's refresh interval, and caps size.
 """
 import asyncio
+import json
 import logging
 import os
 import shlex
@@ -267,7 +268,13 @@ async def get_health(pool: asyncpg.Pool = Depends(get_pool)):
     for a in agents:
         d = dict(a)
         # an agent is 'stale' when it missed ~3 polls
-        interval = ((a["detail"] or {}).get("interval_sec") if isinstance(a["detail"], dict) else None) or 60
+        detail = a["detail"]
+        if isinstance(detail, str):          # asyncpg hands jsonb back as text
+            try:
+                detail = json.loads(detail)
+            except ValueError:
+                detail = {}
+        interval = (detail or {}).get("interval_sec") or 60
         d["alive"] = a["age_seconds"] < max(90, interval * 3)
         d["detail"] = None
         agent_rows.append(d)

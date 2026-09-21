@@ -71,13 +71,13 @@ def test_root_is_public(client):
 
 
 def test_missing_token_is_401(client):
-    r = client.get("/api/v1/logs")
+    r = client.get("/api/v1/users")
     assert r.status_code == 401
     assert r.json() == {"status": "error", "message": "Missing or invalid bearer token"}
 
 
 def test_wrong_token_is_401(client):
-    assert client.get("/api/v1/logs", headers={"Authorization": "Bearer nope"}).status_code == 401
+    assert client.get("/api/v1/users", headers={"Authorization": "Bearer nope"}).status_code == 401
 
 
 def test_pagination_limit_zero_is_422(client):
@@ -136,8 +136,7 @@ def test_websocket_without_token_is_refused(client):
 
 # ── roles ──
 
-def test_viewer_cannot_write_or_read_logs(client):
-    assert client.get("/api/v1/logs", headers=VIEWER).status_code == 403
+def test_viewer_cannot_write(client):
     assert client.post("/api/v1/missions", json={"name": "x"}, headers=VIEWER).status_code == 403
     assert client.post("/api/v1/documents/upload", files={"file": ("a.txt", b"x", "text/plain")}, headers=VIEWER).status_code == 403
     assert client.get("/api/v1/users", headers=VIEWER).status_code == 403
