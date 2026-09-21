@@ -132,15 +132,20 @@ async def resolve(conn: asyncpg.Connection, names: List[str], vis: Visibility) -
     for name in names:
         row = await _find(conn, name, vis)
         if not row:
+            # a typo ("Donal Trump") or a loose form ("Trump's company") still finds the best-known match:
+            # closest alias first, then the thing people mention most
             row = await conn.fetchrow(f"""
-                SELECT DISTINCT ON (e.entity_id) e.entity_id, e.qid, e.kind, e.name, e.description, e.mention_count, e.sitelinks,
-                       similarity(a.alias_norm, lower($1)) AS score
-                FROM entities e JOIN entity_aliases a ON a.entity_id = e.entity_id
-                WHERE e.resolution = 'RESOLVED' AND e.origin <> 'geonames' AND a.alias_norm % lower($1)
-                  {vis.sql('e.origin')} {vis.sql('a.source')}
-                ORDER BY e.entity_id, score DESC
+                SELECT * FROM (
+                    SELECT DISTINCT ON (e.entity_id) e.entity_id, e.qid, e.kind, e.name, e.description, e.mention_count, e.sitelinks,
+                           similarity(a.alias_norm, lower($1)) AS score
+                    FROM entities e JOIN entity_aliases a ON a.entity_id = e.entity_id
+                    WHERE e.resolution = 'RESOLVED' AND e.origin <> 'geonames' AND a.alias_norm % lower($1)
+                      {vis.sql('e.origin')} {vis.sql('a.source')}
+                    ORDER BY e.entity_id, score DESC
+                ) x
+                ORDER BY (score >= 0.6) DESC, mention_count DESC, score DESC, sitelinks DESC LIMIT 1
             """, name)
-            if row and float(row["score"]) < 0.45:
+            if row and float(row["score"]) < 0.4:
                 row = None
         if row:
             d = {"entity_id": str(row["entity_id"]), "qid": row["qid"], "kind": row["kind"], "name": row["name"],
