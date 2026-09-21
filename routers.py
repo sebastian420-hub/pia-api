@@ -62,43 +62,23 @@ class ChatRequest(BaseModel):
 
 @router.post("/chat")
 async def chat_endpoint(body: ChatRequest, pool: asyncpg.Pool = Depends(get_pool), vis: Visibility = Depends(visibility)):
-    """AI Co-Pilot endpoint for tactical interrogation of the Knowledge Graph."""
+    """The assistant: understand → resolve → gather (visibility-filtered) → answer with [n] citations → sources."""
+    import assistant as A
+    history = [m.model_dump() for m in body.history]
+    plan = await A.understand(body.message, history)
     async with pool.acquire() as conn:
-        recent_intel = await conn.fetch(f"""
-            SELECT content_headline, content_summary, entities, priority
-            FROM intelligence_records
-            WHERE created_at > NOW() - INTERVAL '7 days' {vis.sql('source_id')}
-            ORDER BY created_at DESC
-            LIMIT 10;
-        """)
-
-    intel_context = "\n".join(
-        f"- [{r['priority']}] {r['content_headline']}: {r['content_summary'] or ''}" for r in recent_intel
-    )
-
-    system_prompt = f"""
-    You are the Tactical AI Co-Pilot of the Personal Intelligence Agency (PIA).
-    The user (Director) is interrogating you via the Live Dashboard.
-
-    Provide concise, tactical intelligence summaries based strictly on the provided context.
-    Do not invent facts. If the answer is not in the context, say the data is unavailable.
-    Keep responses under 3 paragraphs. Use bullet points for readability.
-
-    CURRENT RECENT INTELLIGENCE CONTEXT:
-    {intel_context}
-    """
-
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(m.model_dump() for m in body.history)
-    messages.append({"role": "user", "content": body.message})
-
+        entities, missing = await A.resolve(conn, plan.names, vis)
+        ctx = await A.gather(conn, plan, body.message, entities, vis)
     try:
-        response = await llm_client.chat.completions.create(model=LLM_MODEL, messages=messages, temperature=0.2)
+        reply, used = await A.answer(body.message, history, plan, ctx, missing)
     except Exception as e:
         logger.error("LLM chat failed: %s", e)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Language model unavailable")
-
-    return {"status": "success", "reply": response.choices[0].message.content}
+    sources = A.sources_for(ctx, used)
+    await note_restricted(pool, vis, "chat", [s.get("source_id") for s in sources])
+    return {"status": "success", "reply": reply, "data": {
+        "sources": sources, "entities": entities, "missing": missing, "window_days": plan.days, "kind": plan.kind,
+        "context_items": len(ctx.items)}}
 
 
 # ═══════════════════════════════════════════════════════════
