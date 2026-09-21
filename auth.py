@@ -183,9 +183,10 @@ class Visibility:
     """What one request may see. `sql(col)` gives the WHERE fragment for a source column;
     `hidden` is the set of restricted sources this user may NOT read (usually empty → no filtering cost)."""
 
-    def __init__(self, user: User, hidden: List[str]):
+    def __init__(self, user: User, hidden: List[str], granted: Optional[List[str]] = None):
         self.user = user
         self.hidden = hidden
+        self.granted = granted or []      # restricted sources this user MAY read: shown "on top" of the shared picture
 
     def sql(self, col: str) -> str:
         """`AND (col IS NULL OR col <> ALL(...))` — restricted sources the user may not read are excluded.
@@ -201,8 +202,20 @@ class Visibility:
 
 async def visibility(request: Request, user: User = Depends(current_user)) -> Visibility:
     pool = request.app.state.pool
+    restricted = await restricted_sources(pool)
     if user.is_admin:
-        return Visibility(user, [])
+        return Visibility(user, [], restricted)
     allowed = set(await visible_sources(pool, user))
-    hidden = [s for s in await restricted_sources(pool) if s not in allowed]
-    return Visibility(user, hidden)
+    hidden = [s for s in restricted if s not in allowed]
+    return Visibility(user, hidden, [s for s in restricted if s in allowed])
+
+
+async def note_restricted(pool: asyncpg.Pool, vis: "Visibility", obj: str, sources) -> None:
+    """Audit a read that returned rows from restricted sources the user is granted (admins included)."""
+    seen = sorted({s for s in sources if s and s in vis.granted})
+    if not seen:
+        return
+    import json
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO audit_log (user_id, action, object, detail) VALUES ($1::uuid, 'read_restricted', $2, $3::jsonb)",
+                           vis.user.user_id, obj[:300], json.dumps({"sources": seen}))

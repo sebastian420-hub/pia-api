@@ -26,9 +26,12 @@ async def audit(pool: asyncpg.Pool, user: Optional[User], action: str, obj: str,
 async def me(user: User = Depends(current_user), pool: asyncpg.Pool = Depends(get_pool)):
     async with pool.acquire() as conn:
         grants = await conn.fetch("SELECT source_id FROM source_grants WHERE user_id = $1::uuid", user.user_id)
-        restricted = await conn.fetchval("SELECT COUNT(*) FROM sources WHERE visibility = 'restricted'")
-    return {"status": "success", "data": {"user_id": user.user_id, "name": user.name, "role": user.role,
-                                          "grants": [g["source_id"] for g in grants], "restricted_sources": restricted}}
+        restricted = await conn.fetch("SELECT source_id FROM sources WHERE visibility = 'restricted'")
+    r_ids = [r["source_id"] for r in restricted]
+    g_ids = [g["source_id"] for g in grants]
+    return {"status": "success", "data": {"user_id": user.user_id, "name": user.name, "role": user.role, "grants": g_ids,
+                                          "restricted_sources": len(r_ids),
+                                          "visible_restricted": r_ids if user.is_admin else [s for s in r_ids if s in g_ids]}}
 
 
 # ── users ──
@@ -195,3 +198,63 @@ async def audit_log(limit: int = Query(100, ge=1, le=1000), action: Optional[str
         d["detail"] = json.loads(d["detail"]) if isinstance(d["detail"], str) else d["detail"]
         out.append(d)
     return {"status": "success", "data": out}
+
+
+# ── deletion: real, cascading, audited ──
+async def _delete_records(conn: asyncpg.Connection, uids: List[uuid.UUID]) -> dict:
+    """A report and everything derived from it: mentions, its events, queue rows, mission relevance."""
+    if not uids:
+        return {"reports": 0, "events": 0}
+    ev = await conn.fetchval("WITH d AS (DELETE FROM events WHERE report_uid = ANY($1::uuid[]) RETURNING 1) SELECT COUNT(*) FROM d", uids)
+    await conn.execute("DELETE FROM mentions WHERE report_uid = ANY($1::uuid[])", uids)
+    await conn.execute("DELETE FROM analysis_queue WHERE uir_uid = ANY($1::uuid[])", uids)
+    await conn.execute("DELETE FROM mission_relevance WHERE kind = 'report' AND ref_id = ANY($1::uuid[])", uids)
+    n = await conn.fetchval("WITH d AS (DELETE FROM intelligence_records WHERE uid = ANY($1::uuid[]) RETURNING 1) SELECT COUNT(*) FROM d", uids)
+    return {"reports": int(n), "events": int(ev)}
+
+
+@router.delete("/reports/{uid}")
+async def delete_report(uid: uuid.UUID, admin: User = Depends(require_admin), pool: asyncpg.Pool = Depends(get_pool)):
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            stats = await _delete_records(conn, [uid])
+    if not stats["reports"]:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such report")
+    await audit(pool, admin, "delete", f"report/{uid}", stats)
+    return {"status": "success", "data": stats}
+
+
+@router.delete("/sources/{source_id}")
+async def delete_source(source_id: str, admin: User = Depends(require_admin), pool: asyncpg.Pool = Depends(get_pool)):
+    """Everything a source ever said: its reports (and their events), its structured events, facts, aliases,
+    ids and listings. Entities stay (other sources may name them); the lines are rebuilt from what is left."""
+    async with pool.acquire() as conn:
+        if not await conn.fetchval("SELECT 1 FROM sources WHERE source_id = $1", source_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such source")
+        async with conn.transaction():
+            uids = [r["uid"] for r in await conn.fetch("SELECT uid FROM intelligence_records WHERE source_id = $1", source_id)]
+            stats = await _delete_records(conn, uids)
+            stats["structured_events"] = int(await conn.fetchval("WITH d AS (DELETE FROM events WHERE source_id = $1 RETURNING 1) SELECT COUNT(*) FROM d", source_id))
+            stats["facts"] = int(await conn.fetchval("WITH d AS (DELETE FROM relations WHERE via_source = $1 RETURNING 1) SELECT COUNT(*) FROM d", source_id))
+            stats["aliases"] = int(await conn.fetchval("WITH d AS (DELETE FROM entity_aliases WHERE source = $1 RETURNING 1) SELECT COUNT(*) FROM d", source_id))
+            stats["ids"] = int(await conn.fetchval("WITH d AS (DELETE FROM external_ids WHERE source_id = $1 RETURNING 1) SELECT COUNT(*) FROM d", source_id))
+            stats["listings"] = int(await conn.fetchval("""
+                WITH d AS (UPDATE entities SET listings = (SELECT COALESCE(jsonb_agg(l), '[]'::jsonb) FROM jsonb_array_elements(listings) l WHERE l->>'source' <> $1::text)
+                           WHERE listings @> jsonb_build_array(jsonb_build_object('source', $1::text)) RETURNING 1) SELECT COUNT(*) FROM d""", source_id))
+            # entities this source created and nothing else names any more are archived, not shown
+            stats["entities_archived"] = int(await conn.fetchval("""
+                WITH d AS (UPDATE entities e SET resolution = 'REJECTED', watch_status = 'PASSIVE', updated_at = NOW()
+                           WHERE e.origin = $1 AND e.mention_count = 0
+                             AND NOT EXISTS (SELECT 1 FROM events ev WHERE ev.actor_id = e.entity_id OR ev.target_id = e.entity_id)
+                             AND NOT EXISTS (SELECT 1 FROM relations r WHERE (r.a_id = e.entity_id OR r.b_id = e.entity_id) AND r.source <> 'cooccurrence')
+                           RETURNING 1) SELECT COUNT(*) FROM d""", source_id))
+            await conn.execute("DELETE FROM connector_runs WHERE source_id = $1", source_id)
+            await conn.execute("DELETE FROM sources WHERE source_id = $1", source_id)
+            # relations built from events are rebuilt hourly; drop the pairs this source alone supported now
+            await conn.execute("""
+                DELETE FROM relations r WHERE r.source = 'events' AND NOT EXISTS (
+                    SELECT 1 FROM events ev WHERE LEAST(ev.actor_id, ev.target_id) = r.a_id AND GREATEST(ev.actor_id, ev.target_id) = r.b_id)
+            """)
+    forget()
+    await audit(pool, admin, "delete", f"source/{source_id}", stats)
+    return {"status": "success", "data": stats}

@@ -9,7 +9,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel, Field
 
-from auth import require_admin, require_analyst, require_token
+from auth import Visibility, note_restricted, require_admin, require_analyst, require_token, visibility
 from config import DOC_DIR, EMBEDDING_MODEL, LLM_MODEL, MAX_UPLOAD_BYTES, llm_client
 
 logger = logging.getLogger("pia-api")
@@ -61,13 +61,13 @@ class ChatRequest(BaseModel):
 
 
 @router.post("/chat")
-async def chat_endpoint(body: ChatRequest, pool: asyncpg.Pool = Depends(get_pool)):
+async def chat_endpoint(body: ChatRequest, pool: asyncpg.Pool = Depends(get_pool), vis: Visibility = Depends(visibility)):
     """AI Co-Pilot endpoint for tactical interrogation of the Knowledge Graph."""
     async with pool.acquire() as conn:
-        recent_intel = await conn.fetch("""
+        recent_intel = await conn.fetch(f"""
             SELECT content_headline, content_summary, entities, priority
             FROM intelligence_records
-            WHERE created_at > NOW() - INTERVAL '7 days'
+            WHERE created_at > NOW() - INTERVAL '7 days' {vis.sql('source_id')}
             ORDER BY created_at DESC
             LIMIT 10;
         """)
@@ -123,8 +123,8 @@ async def get_active_clusters(pool: asyncpg.Pool = Depends(get_pool)):
     return {"status": "success", "data": [dict(r) for r in records]}
 
 
-@router.post("/documents/upload", dependencies=[Depends(require_analyst)])
-async def upload_document(file: UploadFile = File(...)):
+@router.post("/documents/upload")
+async def upload_document(file: UploadFile = File(...), user=Depends(require_analyst)):
     """Receives a PDF/TXT and saves it where the document_agent will pick it up."""
     original = os.path.basename(file.filename or "")
     ext = os.path.splitext(original)[1].lower()
@@ -158,21 +158,25 @@ async def upload_document(file: UploadFile = File(...)):
     finally:
         await file.close()
 
+    # who uploaded it: a human report's reporter becomes a restricted source granted to this user
+    with open(destination + ".meta.json", "w") as meta:
+        json.dump({"uploaded_by": user.user_id, "uploaded_by_name": user.name, "original": original}, meta)
     logger.info("Document upload stored: %s (%d bytes) from %r", safe_name, written, original)
     return {"status": "success", "message": f"File '{original}' queued for ingestion.", "stored_as": safe_name}
 
 
 @router.get("/reports/{uid}")
-async def get_report(uid: uuid.UUID, pool: asyncpg.Pool = Depends(get_pool)):
+async def get_report(uid: uuid.UUID, pool: asyncpg.Pool = Depends(get_pool), vis: Visibility = Depends(visibility)):
     """One report with the fields the UI needs to open it as a selection."""
     async with pool.acquire() as conn:
-        r = await conn.fetchrow("""
+        r = await conn.fetchrow(f"""
             SELECT uid, created_at, published_at, source_type, source_id, source_url, priority, domain,
                    content_headline, content_summary, entities, body_status, ST_Y(geo) AS lat, ST_X(geo) AS lon
-            FROM intelligence_records WHERE uid = $1
+            FROM intelligence_records WHERE uid = $1 {vis.sql('source_id')}
         """, uid)
     if not r:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Report not found")
+    await note_restricted(pool, vis, f"report/{uid}", [r['source_id']])
     d = dict(r)
     d["uid"] = str(d["uid"])
     lat, lon = d.pop("lat"), d.pop("lon")
@@ -181,11 +185,11 @@ async def get_report(uid: uuid.UUID, pool: asyncpg.Pool = Depends(get_pool)):
 
 
 @router.get("/event/{uid}")
-async def get_event_details(uid: uuid.UUID, pool: asyncpg.Pool = Depends(get_pool)):
+async def get_event_details(uid: uuid.UUID, pool: asyncpg.Pool = Depends(get_pool), vis: Visibility = Depends(visibility)):
     """Fetches the AI summary and extracted entities for one intelligence record."""
     async with pool.acquire() as conn:
         record = await conn.fetchrow(
-            "SELECT content_summary, entities FROM intelligence_records WHERE uid = $1", uid
+            f"SELECT content_summary, entities FROM intelligence_records WHERE uid = $1 {vis.sql('source_id')}", uid
         )
     if not record:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Record not found")
@@ -242,6 +246,7 @@ async def get_intelligence_archive(
     limit: int = Query(50, ge=1, le=200),
     mission_id: Optional[uuid.UUID] = None,
     pool: asyncpg.Pool = Depends(get_pool),
+    vis: Visibility = Depends(visibility),
 ):
     """Paginated historical records. Includes lat/lon so the globe can show history on load.
     With `mission_id`, only what that mission scored relevant (alerts always)."""
@@ -249,7 +254,7 @@ async def get_intelligence_archive(
     offset = (page - 1) * limit
     where = f"""WHERE (COALESCE(metadata->>'skip_analysis', 'false') <> 'true' OR COALESCE(metadata->>'alert', 'false') = 'true')
                   AND (source_agent <> 'mission_alerts' OR $3::uuid IS NULL OR mission_id = $3)
-                  {mission_filter(mission_id, 'report', 'uid', '$3')}"""
+                  {mission_filter(mission_id, 'report', 'uid', '$3')} {vis.sql('source_id')}"""
     async with pool.acquire() as conn:
         records = await conn.fetch(f"""
             SELECT uid, created_at, source_type, priority, domain, content_headline, content_summary, entities,
@@ -308,6 +313,7 @@ async def get_entities_by_bbox(
     maxLon: float = Query(..., ge=-180, le=540),
     mission_id: Optional[uuid.UUID] = None,
     pool: asyncpg.Pool = Depends(get_pool),
+    vis: Visibility = Depends(visibility),
 ):
     """
     Watched entities inside the viewport (only the mission's, when one is given). The UI sends maxLon > 180 when the view
@@ -334,7 +340,7 @@ async def get_entities_by_bbox(
                    threat_score, ST_Y(primary_geo) as lat, ST_X(primary_geo) as lon
             FROM entities
             WHERE primary_geo IS NOT NULL AND watch_status != 'PASSIVE' AND ({where})
-              {mission_filter(mission_id, 'entity', 'entities.entity_id', f'${len(args) + 1}')}
+              {mission_filter(mission_id, 'entity', 'entities.entity_id', f'${len(args) + 1}')} {vis.sql('entities.origin')}
             ORDER BY threat_score DESC
             LIMIT 500;
         """, *args, mission_id)
@@ -387,7 +393,7 @@ class SemanticSearchRequest(BaseModel):
 
 
 @router.post("/search/semantic")
-async def semantic_search(body: SemanticSearchRequest, pool: asyncpg.Pool = Depends(get_pool)):
+async def semantic_search(body: SemanticSearchRequest, pool: asyncpg.Pool = Depends(get_pool), vis: Visibility = Depends(visibility)):
     """Vector search across intelligence records or entities."""
     try:
         response = await llm_client.embeddings.create(model=EMBEDDING_MODEL, input=body.query)
@@ -398,12 +404,12 @@ async def semantic_search(body: SemanticSearchRequest, pool: asyncpg.Pool = Depe
 
     async with pool.acquire() as conn:
         if body.target == 'uir':
-            rows = await conn.fetch("""
+            rows = await conn.fetch(f"""
                 SELECT uid, created_at, source_type, priority, domain,
                        content_headline, content_summary, entities,
                        1 - (embedding <=> $1::vector) AS similarity
                 FROM intelligence_records
-                WHERE embedding IS NOT NULL
+                WHERE embedding IS NOT NULL {vis.sql('source_id')}
                 ORDER BY embedding <=> $1::vector
                 LIMIT $2;
             """, embedding_str, body.limit)
@@ -454,6 +460,7 @@ async def get_entity_network(
     min_weight: float = Query(0.0, ge=0),
     limit: int = Query(60, ge=1, le=400),
     pool: asyncpg.Pool = Depends(get_pool),
+    vis: Visibility = Depends(visibility),
 ):
     """
     Relations around an entity for the web view. Event-based edges rank above Wikidata facts,
@@ -476,14 +483,14 @@ async def get_entity_network(
         seen = set(frontier)
         edges = []
         for _ in range(hops):
-            rows = await conn.fetch("""
+            rows = await conn.fetch(f"""
                 SELECT a_id, b_id, kind, source, label, event_count, weight, first_seen, last_seen, topics,
                        verified_count, wire_count, verified_topics, via_source
                 FROM relations
                 WHERE (a_id = ANY($1) OR b_id = ANY($1))
                   AND ($2::text[] IS NULL OR kind = ANY($2))
                   AND ($3::text[] IS NULL OR source = ANY($3))
-                  AND event_count >= $4 AND weight >= $5
+                  AND event_count >= $4 AND weight >= $5 {vis.sql('via_source')}
                 ORDER BY CASE source WHEN 'events' THEN 0 WHEN 'connector' THEN 1 WHEN 'wikidata' THEN 2 ELSE 3 END, weight DESC
                 LIMIT $6
             """, list(frontier), kind_list, source_list, min_events, min_weight, limit)
@@ -498,22 +505,22 @@ async def get_entity_network(
         outlets = {}
         whys = {}
         if pairs:
-            wrows = await conn.fetch("""
+            wrows = await conn.fetch(f"""
                 SELECT DISTINCT ON (a, b, kind) a, b, kind, predicate, action, quote, modality, verifier_verdict, actor_id
                 FROM (SELECT LEAST(actor_id, target_id) AS a, GREATEST(actor_id, target_id) AS b, * FROM events
                       WHERE origin = 'llm' AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL
-                        AND LEAST(actor_id, target_id) = ANY($1) AND GREATEST(actor_id, target_id) = ANY($2)) x
+                        AND LEAST(actor_id, target_id) = ANY($1) AND GREATEST(actor_id, target_id) = ANY($2) {vis.sql('source_id')}) x
                 ORDER BY a, b, kind, (verifier_verdict = 'yes') DESC, (modality = 'asserted') DESC, confidence DESC, event_time DESC
             """, [p[0] for p in pairs], [p[1] for p in pairs])
             whys = {(r['a'], r['b'], r['kind']): {"predicate": r['predicate'] or (r['action'] or '').lower().replace('_', ' '),
                                                   "quote": r['quote'], "modality": r['modality'], "verdict": r['verifier_verdict'],
                                                   "actor_id": str(r['actor_id'])} for r in wrows}
-            rows = await conn.fetch("""
+            rows = await conn.fetch(f"""
                 SELECT LEAST(actor_id, target_id) AS a, GREATEST(actor_id, target_id) AS b,
                        array_agg(DISTINCT COALESCE(source_id, origin)) AS srcs
                 FROM events
                 WHERE actor_id IS NOT NULL AND target_id IS NOT NULL
-                  AND LEAST(actor_id, target_id) = ANY($1) AND GREATEST(actor_id, target_id) = ANY($2)
+                  AND LEAST(actor_id, target_id) = ANY($1) AND GREATEST(actor_id, target_id) = ANY($2) {vis.sql('source_id')}
                 GROUP BY 1, 2
             """, [p[0] for p in pairs], [p[1] for p in pairs])
             outlets = {(r['a'], r['b']): list(r['srcs']) for r in rows}

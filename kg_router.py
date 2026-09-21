@@ -8,7 +8,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from auth import require_admin, require_analyst, require_token
+from auth import Visibility, note_restricted, require_admin, require_analyst, require_token, visibility
 from routers import get_pool
 
 router = APIRouter(dependencies=[Depends(require_token)])
@@ -27,94 +27,112 @@ def _entity(r) -> dict:
     return d
 
 
-async def _find(conn, key: str):
-    """Accepts an entity uuid, a Q-id, or a name/alias."""
+async def _find(conn, key: str, vis=None):
+    """Accepts an entity uuid, a Q-id, or a name/alias. An entity that exists only because a restricted
+    source named it (origin = that source) is invisible to users without a grant."""
+    hide = vis.sql("e.origin") if vis is not None else ""
     try:
         uid = uuid.UUID(key)
-        return await conn.fetchrow(f"SELECT {ENTITY_COLS} FROM entities WHERE entity_id = $1", uid)
+        return await conn.fetchrow(f"SELECT {ENTITY_COLS} FROM entities e WHERE e.entity_id = $1 {hide}", uid)
     except ValueError:
         pass
     if key.upper().startswith("Q") and key[1:].isdigit():
-        row = await conn.fetchrow(f"SELECT {ENTITY_COLS} FROM entities WHERE qid = $1", key.upper())
+        row = await conn.fetchrow(f"SELECT {ENTITY_COLS} FROM entities e WHERE e.qid = $1 {hide}", key.upper())
         if row:
             return row
     return await conn.fetchrow(f"""
         SELECT {ENTITY_COLS} FROM entities e
-        WHERE e.resolution = 'RESOLVED' AND e.entity_id IN (SELECT entity_id FROM entity_aliases WHERE alias_norm = lower($1))
-        ORDER BY e.mention_count DESC, e.sitelinks DESC LIMIT 1
+        WHERE e.resolution IN ('RESOLVED', 'LOCAL') AND e.entity_id IN (SELECT entity_id FROM entity_aliases WHERE alias_norm = lower($1)) {hide}
+        ORDER BY (e.resolution = 'RESOLVED') DESC, e.mention_count DESC, e.sitelinks DESC LIMIT 1
     """, key)
 
 
+async def conn_names(pool, ids):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT entity_id, qid, name, kind FROM entities WHERE entity_id = ANY($1)", list(ids))
+    return {r['entity_id']: r for r in rows}
+
+
 @router.get("/kg/entities/{key}")
-async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
+async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool), vis: Visibility = Depends(visibility)):
     """The 'who is who' card: identity, trend, relations grouped by kind, recent reports."""
     async with pool.acquire() as conn:
-        e = await _find(conn, key)
+        e = await _find(conn, key, vis)
         if not e:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Entity not found")
         eid = e['entity_id']
-        aliases = await conn.fetch("SELECT alias, source FROM entity_aliases WHERE entity_id = $1 ORDER BY alias LIMIT 40", eid)
+        aliases = await conn.fetch(f"SELECT alias, source FROM entity_aliases WHERE entity_id = $1 {vis.sql('source')} ORDER BY alias LIMIT 40", eid)
         trend = await conn.fetchrow("""
             SELECT count(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') AS last_7d,
                    count(*) FILTER (WHERE created_at BETWEEN NOW() - INTERVAL '14 days' AND NOW() - INTERVAL '7 days') AS prev_7d
             FROM mentions WHERE entity_id = $1
         """, eid)
-        rels = await conn.fetch("""
+        rels = await conn.fetch(f"""
             SELECT r.kind, r.source, r.label, r.event_count, r.weight, r.first_seen, r.last_seen, r.directed, r.topics,
                    r.verified_count, r.wire_count, r.verified_topics, r.via_source, r.record_ref, r.properties AS rel_props,
                    (r.a_id = $1) AS outgoing,
                    o.entity_id AS other_id, o.qid AS other_qid, o.name AS other_name, o.kind AS other_kind
             FROM relations r JOIN entities o ON o.entity_id = CASE WHEN r.a_id = $1 THEN r.b_id ELSE r.a_id END
-            WHERE (r.a_id = $1 OR r.b_id = $1)
+            WHERE (r.a_id = $1 OR r.b_id = $1) {vis.sql('r.via_source')}
             -- observed relations first (they are few and matter most), then facts and co-mentions;
             -- a country's 200 "located in" facts must never crowd out its 7 hostile relations
             ORDER BY CASE r.source WHEN 'events' THEN 0 WHEN 'connector' THEN 1 WHEN 'wikidata' THEN 2 ELSE 3 END, r.verified_count DESC, r.weight DESC
             LIMIT 300
         """, eid)
-        reports = await conn.fetch("""
+        reports = await conn.fetch(f"""
             SELECT m.report_uid, m.role, m.surface, u.content_headline, u.created_at, u.source_id, u.priority
             FROM mentions m JOIN intelligence_records u ON u.uid = m.report_uid
-            WHERE m.entity_id = $1 ORDER BY u.created_at DESC LIMIT 20
+            WHERE m.entity_id = $1 {vis.sql('u.source_id')} ORDER BY u.created_at DESC LIMIT 20
         """, eid)
-        event_counts = await conn.fetch("""
+        event_counts = await conn.fetch(f"""
             SELECT action, count(*) AS n FROM events WHERE (actor_id = $1 OR target_id = $1)
-              AND event_time > NOW() - INTERVAL '90 days' GROUP BY action ORDER BY n DESC
+              AND event_time > NOW() - INTERVAL '90 days' {vis.sql('source_id')} GROUP BY action ORDER BY n DESC
         """, eid)
-        pair_sources = await conn.fetch("""
+        pair_sources = await conn.fetch(f"""
             SELECT CASE WHEN actor_id = $1 THEN target_id ELSE actor_id END AS other_id, kind,
                    array_agg(DISTINCT COALESCE(source_id, origin)) AS srcs,
                    array_agg(DISTINCT action) AS actions
-            FROM events WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL
+            FROM events WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL {vis.sql('source_id')}
             GROUP BY 1, 2
         """, eid)
         # the strongest verified event per (other, kind): the words and the quote the connection rests on
-        whys = await conn.fetch("""
+        whys = await conn.fetch(f"""
             SELECT DISTINCT ON (other_id, kind) other_id, kind, predicate, action, quote, modality, source_id, event_time, origin,
                    -- a structured row (connector, human report) was never sent to the verifier: it is "recorded", not "verified"
                    CASE WHEN origin = 'connector' THEN 'recorded' ELSE verifier_verdict END AS verifier_verdict,
                    (actor_id = $1) AS outgoing
             FROM (SELECT CASE WHEN actor_id = $1 THEN target_id ELSE actor_id END AS other_id, * FROM events
                   WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL
-                    AND origin IN ('llm', 'connector')) x
+                    AND origin IN ('llm', 'connector') {vis.sql('source_id')}) x
             ORDER BY other_id, kind, (verifier_verdict = 'yes' OR origin = 'connector') DESC, (modality = 'asserted') DESC, confidence DESC, event_time DESC
         """, eid)
         brief = await conn.fetchrow("SELECT text, generated_at FROM entity_briefs WHERE entity_id = $1", eid)
-        ext_ids = await conn.fetch("SELECT source_id, external_id, kind FROM external_ids WHERE entity_id = $1 ORDER BY source_id, kind LIMIT 40", eid)
-        timeline = await conn.fetch("""
+        # restricted sources this user may read: their events sit on top of the shared lines, never inside them
+        restricted = await conn.fetch("""
+            SELECT CASE WHEN actor_id = $1 THEN target_id ELSE actor_id END AS other_id, kind, COUNT(*) AS n,
+                   MIN(event_time) AS first_seen, MAX(event_time) AS last_seen
+            FROM events WHERE (actor_id = $1 OR target_id = $1) AND actor_id IS NOT NULL AND target_id IS NOT NULL AND kind IS NOT NULL
+              AND source_id = ANY($2::text[]) GROUP BY 1, 2
+        """, eid, vis.granted) if vis.granted else []
+        ext_ids = await conn.fetch(f"SELECT source_id, external_id, kind FROM external_ids WHERE entity_id = $1 {vis.sql('source_id')} ORDER BY source_id, kind LIMIT 40", eid)
+        timeline = await conn.fetch(f"""
             SELECT ev.event_id, ev.event_time, ev.kind, ev.stance, ev.modality, ev.verifier_verdict, COALESCE(ev.predicate, ev.action) AS predicate,
                    a.name AS actor, t.name AS target, ev.quote, ev.source_id, ev.origin
             FROM events ev JOIN entities a ON a.entity_id = ev.actor_id LEFT JOIN entities t ON t.entity_id = ev.target_id
-            WHERE (ev.actor_id = $1 OR ev.target_id = $1) AND ev.origin IN ('llm', 'connector') AND ev.event_time > NOW() - INTERVAL '30 days'
+            WHERE (ev.actor_id = $1 OR ev.target_id = $1) AND ev.origin IN ('llm', 'connector') AND ev.event_time > NOW() - INTERVAL '30 days' {vis.sql('ev.source_id')}
             ORDER BY ev.event_time DESC LIMIT 120
         """, eid)
     srcs_by_pair = {(r['other_id'], r['kind']): {"sources": list(r['srcs']), "actions": list(r['actions'])} for r in pair_sources}
     why_by_pair = {(w['other_id'], w['kind']): {"predicate": w['predicate'] or (w['action'] or '').lower().replace('_', ' '),
                                                  "quote": w['quote'], "modality": w['modality'], "verdict": w['verifier_verdict'],
                                                  "outlet": w['source_id'], "when": w['event_time'], "outgoing": w['outgoing']} for w in whys}
+    restricted_by_pair = {(r['other_id'], r['kind']): r for r in restricted}
     grouped: dict = {}
     for r in rels:
         extra = srcs_by_pair.get((r['other_id'], r['kind']), {}) if r['source'] == 'events' else {}
+        rc = restricted_by_pair.pop((r['other_id'], r['kind']), None) if r['source'] == 'events' else None
         grouped.setdefault(r['kind'], []).append({
+            "restricted_count": int(rc['n']) if rc else 0,
             "sources": extra.get("sources", []), "actions": extra.get("actions", []),
             "why": why_by_pair.get((r['other_id'], r['kind'])) if r['source'] == 'events' else None,
             "entity_id": str(r['other_id']), "qid": r['other_qid'], "name": r['other_name'], "kind": r['other_kind'],
@@ -125,8 +143,26 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
             "properties": (json.loads(r['rel_props']) if isinstance(r['rel_props'], str) else r['rel_props']) if r['source'] == 'connector' else None,
             "first_seen": r['first_seen'], "last_seen": r['last_seen'], "direction": ("out" if r['outgoing'] else "in") if r['directed'] else None,
         })
+    # pairs that exist only in restricted sources: a row of their own, marked, for those who may see them
+    if restricted_by_pair:
+        others = await conn_names(pool, [k[0] for k in restricted_by_pair])
+        for (oid, kind), rc in restricted_by_pair.items():
+            o = others.get(oid)
+            if not o:
+                continue
+            grouped.setdefault(kind, []).append({
+                "restricted_count": int(rc['n']), "sources": [], "actions": [], "why": why_by_pair.get((oid, kind)),
+                "entity_id": str(oid), "qid": o['qid'], "name": o['name'], "kind": o['kind'],
+                "label": "restricted", "source": "events", "event_count": int(rc['n']), "weight": 0.0,
+                "topics": [], "verified_topics": [], "verified_count": 0, "wire_count": 0, "via_source": None, "record_ref": None,
+                "properties": None, "first_seen": rc['first_seen'], "last_seen": rc['last_seen'], "direction": None,
+            })
+    await note_restricted(pool, vis, f"entity/{eid}", [t['source_id'] for t in timeline] + [r['source_id'] for r in reports] + list(vis.granted if restricted else []))
+    card = _entity(e)
+    # listings carry their source; a viewer without a grant never sees a restricted list
+    card["listings"] = [l for l in (card.get("listings") or []) if vis.allows(l.get("source"))]
     return {"status": "success", "data": {
-        **_entity(e),
+        **card,
         "aliases": [dict(a) for a in aliases],
         "trend": dict(trend) if trend else None,
         "relations": grouped,
@@ -141,12 +177,12 @@ async def entity_card(key: str, pool: asyncpg.Pool = Depends(get_pool)):
 
 @router.get("/kg/entities/{key}/events")
 async def entity_events(key: str, from_: Optional[datetime] = Query(None, alias="from"), to: Optional[datetime] = None,
-                        action: Optional[str] = None, limit: int = Query(100, ge=1, le=500), pool: asyncpg.Pool = Depends(get_pool)):
+                        action: Optional[str] = None, limit: int = Query(100, ge=1, le=500), pool: asyncpg.Pool = Depends(get_pool), vis: Visibility = Depends(visibility)):
     async with pool.acquire() as conn:
-        e = await _find(conn, key)
+        e = await _find(conn, key, vis)
         if not e:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Entity not found")
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT ev.event_id, ev.event_time, ev.time_precision, ev.action, ev.confidence, ev.tone, ev.quote, ev.origin, ev.source_id,
                    ev.report_uid, u.content_headline,
                    a.name AS actor, a.qid AS actor_qid, t.name AS target, t.qid AS target_qid, l.name AS location,
@@ -158,9 +194,10 @@ async def entity_events(key: str, from_: Optional[datetime] = Query(None, alias=
             LEFT JOIN intelligence_records u ON u.uid = ev.report_uid
             WHERE (ev.actor_id = $1 OR ev.target_id = $1 OR ev.location_id = $1)
               AND ($2::timestamptz IS NULL OR ev.event_time >= $2) AND ($3::timestamptz IS NULL OR ev.event_time <= $3)
-              AND ($4::text IS NULL OR ev.action = $4)
+              AND ($4::text IS NULL OR ev.action = $4) {vis.sql('ev.source_id')}
             ORDER BY ev.event_time DESC LIMIT $5
         """, e['entity_id'], from_, to, action, limit)
+    await note_restricted(pool, vis, f"entity/{e['entity_id']}/events", [r['source_id'] for r in rows])
     return {"status": "success", "data": [_event(r) for r in rows]}
 
 
@@ -236,15 +273,16 @@ def _topics(raw, top: int = 3):
 
 
 @router.get("/kg/relations/{a}/{b}")
-async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200), pool: asyncpg.Pool = Depends(get_pool)):
+async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200), pool: asyncpg.Pool = Depends(get_pool),
+                            vis: Visibility = Depends(visibility)):
     """Why are these two connected: the events (with quotes) and the Wikidata facts between them."""
     async with pool.acquire() as conn:
-        ea, eb = await _find(conn, a), await _find(conn, b)
+        ea, eb = await _find(conn, a, vis), await _find(conn, b, vis)
         if not ea or not eb:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Entity not found")
-        rels = await conn.fetch("SELECT kind, source, label, event_count, weight, first_seen, last_seen, topics, verified_count, wire_count, verified_topics FROM relations WHERE (a_id = $1 AND b_id = $2) OR (a_id = $2 AND b_id = $1)",
+        rels = await conn.fetch(f"SELECT kind, source, label, event_count, weight, first_seen, last_seen, topics, verified_count, wire_count, verified_topics, via_source, record_ref FROM relations WHERE ((a_id = $1 AND b_id = $2) OR (a_id = $2 AND b_id = $1)) {vis.sql('via_source')}",
                                 ea['entity_id'], eb['entity_id'])
-        evs = await conn.fetch("""
+        evs = await conn.fetch(f"""
             SELECT ev.event_id, ev.event_time, ev.action, ev.kind, ev.topic, ev.code, ev.confidence, ev.quote, ev.source_id, ev.origin, ev.report_uid,
                    ev.outlets, ev.predicate, ev.stance, ev.modality, ev.polarity, ev.verifier_note, ev.record_ref,
                    CASE WHEN ev.origin = 'connector' THEN 'recorded' ELSE ev.verifier_verdict END AS verifier_verdict,
@@ -253,15 +291,16 @@ async def relation_evidence(a: str, b: str, limit: int = Query(50, ge=1, le=200)
                    a.name AS actor, t.name AS target
             FROM events ev LEFT JOIN intelligence_records u ON u.uid = ev.report_uid
             LEFT JOIN entities a ON a.entity_id = ev.actor_id LEFT JOIN entities t ON t.entity_id = ev.target_id
-            WHERE (ev.actor_id = $1 AND ev.target_id = $2) OR (ev.actor_id = $2 AND ev.target_id = $1)
+            WHERE ((ev.actor_id = $1 AND ev.target_id = $2) OR (ev.actor_id = $2 AND ev.target_id = $1)) {vis.sql('ev.source_id')}
             ORDER BY (ev.origin <> 'gdelt') DESC, ev.event_time DESC LIMIT $3
         """, ea['entity_id'], eb['entity_id'], limit)
-        shared = await conn.fetch("""
+        shared = await conn.fetch(f"""
             SELECT u.uid, u.content_headline, u.created_at, u.source_id FROM intelligence_records u
             WHERE u.uid IN (SELECT report_uid FROM mentions WHERE entity_id = $1)
-              AND u.uid IN (SELECT report_uid FROM mentions WHERE entity_id = $2)
+              AND u.uid IN (SELECT report_uid FROM mentions WHERE entity_id = $2) {vis.sql('u.source_id')}
             ORDER BY u.created_at DESC LIMIT 10
         """, ea['entity_id'], eb['entity_id'])
+    await note_restricted(pool, vis, f"evidence/{ea['entity_id']}/{eb['entity_id']}", [x['source_id'] for x in evs] + [x['source_id'] for x in shared])
     return {"status": "success", "data": {
         "a": _entity(ea), "b": _entity(eb),
         "relations": [dict(r, topics=_topics(r['topics']), verified_topics=_topics(r['verified_topics'])) for r in rels],
@@ -275,7 +314,8 @@ WINDOWS = {"24h": "24 hours", "7d": "7 days", "30d": "30 days", "90d": "90 days"
 @router.get("/kg/web/overview")
 async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
                        min_events: int = Query(3, ge=1), limit: int = Query(400, ge=10, le=2000),
-                       mission_id: Optional[uuid.UUID] = None, pool: asyncpg.Pool = Depends(get_pool)):
+                       mission_id: Optional[uuid.UUID] = None, pool: asyncpg.Pool = Depends(get_pool),
+                       vis: Visibility = Depends(visibility)):
     """
     The web from far away, for the globe (only the mission's events, when one is given): every entity that acted (or was acted on) in the
     window, with its position (own, or its country's), its activity, and the strongest pairs
@@ -283,7 +323,7 @@ async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
     """
     from missions_router import mission_filter
     interval = WINDOWS[window]
-    mf = mission_filter(mission_id, 'event', 'events.event_id', '$3')
+    mf = mission_filter(mission_id, 'event', 'events.event_id', '$3') + vis.sql('events.source_id')
     async with pool.acquire() as conn:
         pairs = await conn.fetch(f"""
             WITH pt AS (
@@ -335,7 +375,7 @@ async def web_overview(window: str = Query("7d", pattern="^(24h|7d|30d|90d)$"),
                    (e.primary_geo IS NULL AND cap.primary_geo IS NULL AND c.primary_geo IS NOT NULL) AS orbits,
                    c.entity_id AS country_id,
                    (SELECT COUNT(*) FROM events ev WHERE (ev.actor_id = e.entity_id OR ev.target_id = e.entity_id)
-                       AND ev.event_time > NOW() - INTERVAL '{interval}') AS activity
+                       AND ev.event_time > NOW() - INTERVAL '{interval}' {vis.sql('ev.source_id')}) AS activity
             FROM entities e
             LEFT JOIN entities c ON c.qid = e.country_qid AND c.kind = 'COUNTRY'
             LEFT JOIN LATERAL (
@@ -364,7 +404,7 @@ async def list_events(from_: Optional[datetime] = Query(None, alias="from"), to:
                       action: Optional[str] = None, min_confidence: float = Query(0.5, ge=0, le=1),
                       minLat: Optional[float] = None, minLon: Optional[float] = None, maxLat: Optional[float] = None, maxLon: Optional[float] = None,
                       limit: int = Query(500, ge=1, le=5000), mission_id: Optional[uuid.UUID] = None,
-                      pool: asyncpg.Pool = Depends(get_pool)):
+                      pool: asyncpg.Pool = Depends(get_pool), vis: Visibility = Depends(visibility)):
     """Events for the globe / timeline (only the mission's, when one is given)."""
     from missions_router import mission_filter
     bbox = None not in (minLat, minLon, maxLat, maxLon)
@@ -379,7 +419,7 @@ async def list_events(from_: Optional[datetime] = Query(None, alias="from"), to:
             WHERE ev.confidence >= $1
               AND ($2::timestamptz IS NULL OR ev.event_time >= $2) AND ($3::timestamptz IS NULL OR ev.event_time <= $3)
               AND ($4::text IS NULL OR ev.action = $4)
-              {mission_filter(mission_id, 'event', 'ev.event_id', '$6')}
+              {mission_filter(mission_id, 'event', 'ev.event_id', '$6')} {vis.sql('ev.source_id')}
               {"AND ev.geo && ST_MakeEnvelope($7, $8, $9, $10, 4326)" if bbox else ""}
             ORDER BY ev.event_time DESC LIMIT $5
         """, min_confidence, from_, to, action, limit, mission_id, *([minLon, minLat, maxLon, maxLat] if bbox else []))
@@ -387,7 +427,8 @@ async def list_events(from_: Optional[datetime] = Query(None, alias="from"), to:
 
 
 @router.get("/kg/search")
-async def search_entities(q: str = Query(..., min_length=1, max_length=200), limit: int = Query(10, ge=1, le=50), pool: asyncpg.Pool = Depends(get_pool)):
+async def search_entities(q: str = Query(..., min_length=1, max_length=200), limit: int = Query(10, ge=1, le=50), pool: asyncpg.Pool = Depends(get_pool),
+                          vis: Visibility = Depends(visibility)):
     """Alias search over the web (exact first, then fuzzy)."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"""
@@ -395,6 +436,7 @@ async def search_entities(q: str = Query(..., min_length=1, max_length=200), lim
                    similarity(a.alias_norm, lower($1)) AS score
             FROM entities e JOIN entity_aliases a ON a.entity_id = e.entity_id
             WHERE e.resolution = 'RESOLVED' AND e.origin <> 'geonames' AND (a.alias_norm = lower($1) OR a.alias_norm % lower($1))
+              {vis.sql('e.origin')} {vis.sql('a.source')}
             ORDER BY e.entity_id, score DESC
         """, q)
     ranked = sorted(rows, key=lambda r: (r['score'], r['mention_count'] or 0, r['sitelinks'] or 0), reverse=True)[:limit]
@@ -451,13 +493,13 @@ class ReviewDecision(BaseModel):
 
 
 @router.get("/kg/review")
-async def review_queue(limit: int = Query(50, ge=1, le=200), pool: asyncpg.Pool = Depends(get_pool)):
+async def review_queue(limit: int = Query(50, ge=1, le=200), pool: asyncpg.Pool = Depends(get_pool), vis: Visibility = Depends(visibility)):
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT e.entity_id, e.name, e.kind, e.mention_count, e.created_at, e.metadata,
                    (SELECT json_agg(json_build_object('report_uid', m.report_uid, 'surface', m.surface, 'headline', u.content_headline))
                     FROM (SELECT * FROM mentions WHERE entity_id = e.entity_id ORDER BY created_at DESC LIMIT 3) m
-                    JOIN intelligence_records u ON u.uid = m.report_uid) AS examples
+                    JOIN intelligence_records u ON u.uid = m.report_uid WHERE TRUE {vis.sql('u.source_id')}) AS examples
             FROM entities e WHERE e.resolution = 'NEEDS_REVIEW'
             ORDER BY e.mention_count DESC, e.created_at DESC LIMIT $1
         """, limit)
