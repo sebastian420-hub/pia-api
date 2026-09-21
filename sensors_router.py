@@ -20,7 +20,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 
-from auth import require_token
+from auth import require_admin, require_analyst, require_token
 from routers import get_pool
 
 logger = logging.getLogger("pia-api.sensors")
@@ -344,7 +344,7 @@ async def live_status(pool: asyncpg.Pool = Depends(get_pool)):
     }}
 
 
-@router.post("/live/start", status_code=status.HTTP_201_CREATED)
+@router.post("/live/start", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_analyst)])
 async def live_start(body: LiveStartRequest, pool: asyncpg.Pool = Depends(get_pool)):
     """Starts the relay (if a start hook is configured) and opens a time-boxed session."""
     if not RELAY_URL:
@@ -367,7 +367,7 @@ async def live_start(body: LiveStartRequest, pool: asyncpg.Pool = Depends(get_po
     return {"status": "success", "data": _session_payload(row)}
 
 
-@router.post("/live/stop")
+@router.post("/live/stop", dependencies=[Depends(require_analyst)])
 async def live_stop(pool: asyncpg.Pool = Depends(get_pool)):
     async with pool.acquire() as conn:
         live = await _active_session(conn)

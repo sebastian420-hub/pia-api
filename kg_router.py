@@ -8,7 +8,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from auth import require_token
+from auth import require_admin, require_analyst, require_token
 from routers import get_pool
 
 router = APIRouter(dependencies=[Depends(require_token)])
@@ -198,7 +198,7 @@ class VerbEdit(BaseModel):
     into: Optional[uuid.UUID] = None
 
 
-@router.post("/kg/verbs/{verb_id}")
+@router.post("/kg/verbs/{verb_id}", dependencies=[Depends(require_analyst)])
 async def edit_verb(verb_id: uuid.UUID, body: VerbEdit, pool: asyncpg.Pool = Depends(get_pool)):
     """Curate a verb: rename, move to another family, set its default stance, merge into another, reject, approve."""
     async with pool.acquire() as conn:
@@ -490,7 +490,7 @@ async def review_queue(limit: int = Query(50, ge=1, le=200), pool: asyncpg.Pool 
     return {"status": "success", "data": out, "total": total}
 
 
-@router.post("/kg/review/{entity_id}")
+@router.post("/kg/review/{entity_id}", dependencies=[Depends(require_analyst)])
 async def review_decide(entity_id: uuid.UUID, body: ReviewDecision, pool: asyncpg.Pool = Depends(get_pool)):
     """merge → into the Wikidata item `qid` (loaded on demand); keep → LOCAL; reject → REJECTED."""
     async with pool.acquire() as conn:

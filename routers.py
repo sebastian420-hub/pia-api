@@ -9,7 +9,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel, Field
 
-from auth import require_token
+from auth import require_admin, require_analyst, require_token
 from config import DOC_DIR, EMBEDDING_MODEL, LLM_MODEL, MAX_UPLOAD_BYTES, llm_client
 
 logger = logging.getLogger("pia-api")
@@ -123,7 +123,7 @@ async def get_active_clusters(pool: asyncpg.Pool = Depends(get_pool)):
     return {"status": "success", "data": [dict(r) for r in records]}
 
 
-@router.post("/documents/upload")
+@router.post("/documents/upload", dependencies=[Depends(require_analyst)])
 async def upload_document(file: UploadFile = File(...)):
     """Receives a PDF/TXT and saves it where the document_agent will pick it up."""
     original = os.path.basename(file.filename or "")
@@ -198,7 +198,7 @@ async def get_event_details(uid: uuid.UUID, pool: asyncpg.Pool = Depends(get_poo
     }
 
 
-@router.get("/logs")
+@router.get("/logs", dependencies=[Depends(require_admin)])
 async def get_system_logs(pool: asyncpg.Pool = Depends(get_pool)):
     """Latest agent activity across the queue and the ingestors, for the UI terminal."""
     async with pool.acquire() as conn:
@@ -552,7 +552,7 @@ class FeedbackRequest(BaseModel):
     human_correction: Optional[str] = Field(None, max_length=2000)
 
 
-@router.post("/feedback", status_code=status.HTTP_201_CREATED)
+@router.post("/feedback", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_analyst)])
 async def submit_feedback(body: FeedbackRequest, pool: asyncpg.Pool = Depends(get_pool)):
     """Human verdict on one extracted event (a claim). Rejections remove it from the web."""
     async with pool.acquire() as conn:

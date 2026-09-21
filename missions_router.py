@@ -14,7 +14,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from auth import require_token
+from auth import require_admin, require_analyst, require_token
 from routers import get_pool
 
 router = APIRouter(dependencies=[Depends(require_token)])
@@ -116,7 +116,7 @@ async def get_mission(mission_id: uuid.UUID, pool: asyncpg.Pool = Depends(get_po
     return {"status": "success", "data": d}
 
 
-@router.post("/missions", status_code=status.HTTP_201_CREATED)
+@router.post("/missions", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_analyst)])
 async def create_mission(body: MissionIn, pool: asyncpg.Pool = Depends(get_pool)):
     async with pool.acquire() as conn:
         try:
@@ -131,7 +131,7 @@ async def create_mission(body: MissionIn, pool: asyncpg.Pool = Depends(get_pool)
     return {"status": "success", "data": _row(row)}
 
 
-@router.put("/missions/{mission_id}")
+@router.put("/missions/{mission_id}", dependencies=[Depends(require_analyst)])
 async def update_mission(mission_id: uuid.UUID, body: MissionIn, pool: asyncpg.Pool = Depends(get_pool)):
     async with pool.acquire() as conn:
         area = _area_sql(body.bbox) if body.bbox is not None else "area"
@@ -147,7 +147,7 @@ async def update_mission(mission_id: uuid.UUID, body: MissionIn, pool: asyncpg.P
     return {"status": "success", "data": _row(row)}
 
 
-@router.post("/missions/{mission_id}/activate")
+@router.post("/missions/{mission_id}/activate", dependencies=[Depends(require_analyst)])
 async def activate_mission(mission_id: uuid.UUID, pool: asyncpg.Pool = Depends(get_pool)):
     """One mission is active at a time: it is what the agents read first and what the screens show by default."""
     async with pool.acquire() as conn:
@@ -159,7 +159,7 @@ async def activate_mission(mission_id: uuid.UUID, pool: asyncpg.Pool = Depends(g
     return {"status": "success", "data": _row(row)}
 
 
-@router.delete("/missions/{mission_id}")
+@router.delete("/missions/{mission_id}", dependencies=[Depends(require_admin)])
 async def delete_mission(mission_id: uuid.UUID, pool: asyncpg.Pool = Depends(get_pool)):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT name, is_active FROM missions WHERE mission_id = $1", mission_id)

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import List
@@ -10,32 +11,38 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import config  # loads .env first
-from auth import ws_token_ok
+from auth import ws_user, visible_sources, restricted_sources
 from routers import router as api_router
 from sensors_router import router as sensors_router, live_session_reaper
 from kg_router import router as kg_router
 from missions_router import router as missions_router
+from users_router import router as users_router, audit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("pia-api")
 
 
 class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
+    """Live-feed sockets, each with the restricted sources its user may NOT see."""
 
-    async def connect(self, websocket: WebSocket):
+    def __init__(self):
+        self.active_connections: dict = {}      # websocket → set(hidden source ids)
+
+    async def connect(self, websocket: WebSocket, hidden):
         await websocket.accept()
-        self.active_connections.append(websocket)
-        logger.info(f"WebSocket connected. Total clients: {len(self.active_connections)}")
+        self.active_connections[websocket] = set(hidden)
 
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-        logger.info(f"WebSocket disconnected. Total clients: {len(self.active_connections)}")
+        self.active_connections.pop(websocket, None)
 
     async def broadcast(self, message: str):
-        for connection in list(self.active_connections):
+        try:
+            source_id = json.loads(message).get("source_id")
+        except Exception:
+            source_id = None
+        for connection, hidden in list(self.active_connections.items()):
+            if source_id and source_id in hidden:
+                continue
             try:
                 await connection.send_text(message)
             except Exception as e:
@@ -78,7 +85,7 @@ async def lifespan(app: FastAPI):
     app.state.pg_task = asyncio.create_task(listen_to_pg_notify())
     app.state.reaper_task = asyncio.create_task(live_session_reaper(app.state.pool))
     if not config.PIA_API_TOKEN:
-        logger.error("PIA_API_TOKEN is not set: every authenticated route will answer 503.")
+        logger.warning("PIA_API_TOKEN is not set: only tokens minted in the database will work.")
     yield
     app.state.pg_task.cancel()
     app.state.reaper_task.cancel()
@@ -95,10 +102,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def audit_writes(request: Request, call_next):
+    """Every write by a signed-in user leaves an audit row (the user is resolved by the route's dependency)."""
+    response = await call_next(request)
+    user = getattr(request.state, "user", None)
+    if user is not None and request.method in ("POST", "PUT", "DELETE") and response.status_code < 400 \
+            and not request.url.path.endswith(("/live/start", "/live/stop")):
+        try:
+            await audit(request.app.state.pool, user, "write", f"{request.method} {request.url.path}", {"status": response.status_code})
+        except Exception as e:
+            logger.warning(f"audit: {e}")
+    return response
+
+
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(sensors_router, prefix="/api/v1")
 app.include_router(kg_router, prefix="/api/v1")
 app.include_router(missions_router, prefix="/api/v1")
+app.include_router(users_router, prefix="/api/v1")
 
 
 # The UI checks `status === 'success'` and shows `message` otherwise, so error
@@ -130,10 +152,13 @@ def read_root():
 @app.websocket("/ws/live")
 async def websocket_endpoint(websocket: WebSocket):
     """Live intelligence feed. Requires ?token=<PIA_API_TOKEN> on the handshake."""
-    if not ws_token_ok(websocket):
+    user = await ws_user(websocket)
+    if user is None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
-    await manager.connect(websocket)
+    pool = websocket.app.state.pool
+    hidden = [] if user.is_admin else [s for s in await restricted_sources(pool) if s not in set(await visible_sources(pool, user))]
+    await manager.connect(websocket, hidden)
     try:
         while True:
             await websocket.receive_text()
